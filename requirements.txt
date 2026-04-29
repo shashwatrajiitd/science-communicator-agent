@@ -1,0 +1,50 @@
+# ============================================================
+# Science Communicator — 3B1B-style video & animation toolkit
+# ============================================================
+
+# --- Core animation engine (3B1B's library) ---
+manim>=0.20.1                 # Community Manim (actively maintained fork)
+manimpango>=0.5.0             # Text rendering for Manim
+# manimgl                     # 3B1B's original — install separately if needed
+
+# --- Video editing / post-processing ---
+moviepy>=1.0.3                # Programmatic video editing (cuts, overlays, audio)
+ffmpeg-python>=0.2.0          # Python bindings to ffmpeg
+imageio>=2.34.0
+imageio-ffmpeg>=0.4.9
+opencv-python>=4.9.0          # Frame-level processing
+Pillow>=10.0.0
+
+# --- Voiceover (auto-syncs animation timing to TTS) ---
+manim-voiceover[gtts]>=0.3.7  # Built-in narration in Manim scenes
+# System dep: brew install sox (already installed)
+setuptools<81                 # pkg_resources still required by manim-voiceover
+
+# --- Audio ---
+pydub>=0.25.1                 # Audio editing
+soundfile>=0.12.1
+numpy>=1.26.0
+scipy>=1.12.0
+
+# --- AI / LLM (Gemini via Google ADK) ---
+google-adk                    # Google Agent Development Kit
+google-genai                  # Gemini API client (new, ADK-compatible)
+# google-generativeai is intentionally NOT pinned: its protobuf<6 cap
+# conflicts with google-adk. Use google-genai instead.
+
+# --- Text-to-speech for narration ---
+gtts>=2.5.1                   # Google TTS (free)
+elevenlabs>=1.0.0             # ElevenLabs (high-quality narration)
+edge-tts>=6.1.0               # Microsoft Edge TTS (free, high quality)
+
+# --- Math / scientific rendering ---
+sympy>=1.12
+networkx>=3.2
+matplotlib>=3.8.0
+
+# --- Utilities ---
+python-dotenv>=1.0.0          # Load API keys from .env
+rich>=13.7.0                  # Pretty terminal output
+typer>=0.12.0                 # CLI interface
+pyyaml>=6.0
+tqdm>=4.66.0
