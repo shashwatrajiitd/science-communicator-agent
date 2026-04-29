@@ -56,8 +56,82 @@ manim -pql scenes/example.py SquareToCircle
 ## Generate a video from a prompt (Gemini + Manim)
 
 ```bash
+# Default 16:9 landscape — sequential + self-validating tool-use worker
 python scripts/generate.py "Explain the Fourier transform visually"
+
+# Vertical / Shorts / Reels (9:16)
+python scripts/generate.py "Why does pi appear in a Gaussian?" --aspect 9:16 --quality h
+
+# Square / Instagram (1:1) and 4:5
+python scripts/generate.py "..." --aspect 1:1
+python scripts/generate.py "..." --aspect 4:5
+
+# Legacy parallel mode (faster, no prior-scene context, no self-validation)
+python scripts/generate.py "..." --parallel --parallelism 4
 ```
+
+`--aspect-ratio` (alias `--aspect`) accepts forms like `16:9`, `9:16`, `1:1`,
+`4:5`, `21:9`. The short side is anchored to the `--quality` preset
+(`l`/`m`/`h`/`k` → 480/720/1080/2160 px), so `--aspect 9:16 --quality h`
+produces a 1080×1920 video. Manim is invoked with `-r W,H` and the worker
+prompt is adjusted with layout guidance for portrait/square frames.
+
+### Sequential pipeline (default)
+
+Scenes render one at a time. Each worker is a Gemini function-calling agent
+that drives its own render → inspect → fix loop using these tools:
+
+- `render_manim(code, scene_class)` — write code to disk, run manim, get back
+  success/log_tail/video_path/duration
+- `extract_frames(video_path, n)` — sample frames as PNGs and inspect them
+- `probe_audio(video_path)` — verify the voiceover rendered
+- `compare_to_prior_frame(this_frame_path)` — vision-diff against the prior
+  scene's last frame to catch continuity drift
+- `done(video_path, ending_state_summary)` — terminal call; the summary is
+  handed to the next scene's worker for visual continuity
+
+Scene N+1 receives scene N's last-frame PNG, the `ending_state_summary` text,
+and scene N's full Python source. The hard ceiling on tool calls per scene is
+`--max-tool-iterations` (default 8).
+
+### Parallel pipeline (`--parallel`)
+
+The legacy path: every scene rendered concurrently, no cross-scene context,
+post-hoc continuity check. Faster wall-clock when continuity isn't critical.
+
+### Interactive review with `--plan-mode`
+
+Human-in-the-loop. Required for both gates: approve the master's plan before
+any rendering starts, and approve every scene before continuing to the next.
+
+```bash
+python scripts/generate.py "Why does pi appear in a Gaussian?" --plan-mode
+```
+
+Flow:
+1. The planner emits a `ScenePlan`.
+2. You see a rich table with each scene's id, duration, description, and
+   beats. Press `[a]` to approve, `[c]` to comment, or `[q]` to quit.
+3. On `c`, you type one line of feedback; the planner rewrites the plan with
+   your feedback applied. Loop until approval (capped at 5 rounds).
+4. Phase 2 starts. Each scene renders sequentially with the tool-use worker.
+5. After each scene renders, the mp4 auto-opens (macOS QuickTime). Press
+   `[a]` to approve, `[c]` to comment + re-render, `[r]` to retry without a
+   comment, or `[q]` to quit.
+6. Once approved, the next scene's worker starts with your approved scene's
+   ending state as its prior context.
+7. Stitch + finish.
+
+`--plan-mode` requires sequential mode (no `--parallel`). The QA loop is
+forced off in plan-mode (you've already approved every scene; QA would
+re-render silently and second-guess the operator).
+
+Other plan-mode flags:
+- `--no-plan-mode-open` — don't auto-open the rendered mp4 (useful over SSH).
+- `--plan-mode-max-rounds N` — cap on revision rounds per plan/scene
+  (default 5; the cap is a guard against runaway feedback loops).
+
+Every action is appended to `output/<run_id>/reviews.jsonl` for audit.
 
 ## Notes
 

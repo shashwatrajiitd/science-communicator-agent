@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from src.gemini_agent import SYSTEM_PROMPT as _RAW_BASE_WORKER_PROMPT
 
 
@@ -112,6 +114,28 @@ Output ONLY a valid JSON object matching the ScenePlan schema. No prose, no fenc
 """
 
 
+MASTER_PLAN_REVISION_PROMPT = r"""You are revising a previously-drafted video
+plan based on operator feedback. The user gives you the current ScenePlan as
+JSON and a one-line comment describing what they want changed. Your job:
+
+1. Apply the feedback EXACTLY. Do not introduce unrelated edits. If the user
+   says "shorter narration in scene 02", only scene 02's beats should change.
+2. Preserve everything else. The structure (number of scenes, ids, slugs,
+   total_target_seconds, voice, shared_objects) stays the same unless the
+   feedback explicitly asks for a structural change.
+3. If the feedback asks for a new shared_object, add it to `shared_objects`
+   with concrete vertex coordinates and update the relevant `appears_in`.
+4. If the feedback asks to delete or reorder scenes, do so and renumber ids
+   (`01`, `02`, ...). Update `appears_in` lists in shared_objects to match.
+5. Re-emit the COMPLETE ScenePlan as JSON. Don't emit a diff or partial.
+
+The original planner's constraints still apply (verbatim TTS beats, snake_case
+slugs, NarrationBeat shape, etc. — see your planner system prompt).
+
+Output ONLY a valid JSON object matching the ScenePlan schema. No prose, no fences.
+"""
+
+
 # ---------------------------------------------------------------------------
 # Worker (per-scene code generator)
 # ---------------------------------------------------------------------------
@@ -171,14 +195,71 @@ spec describes — same geometry, vertices, color, orientation, label.
   doesn't get confused with the shared object.
 """
 
+
+# Tool-driven self-validation loop. Appended ONLY to the system prompt of the
+# tool-using worker. The legacy text-only worker uses _BASE_WORKER_PROMPT +
+# _WORKER_HEADER_OVERRIDE alone and never sees this section.
+_WORKER_TOOL_USAGE = r"""
+# SELF-VALIDATION LOOP — YOU DRIVE IT WITH FUNCTION CALLS
+
+You are not just emitting code. You operate a render → inspect → fix loop:
+
+  1. Write candidate Python in your head, then call `render_manim(code, scene_class)`.
+     - If `success=false`, READ the `log_tail`, fix the error, call render_manim again.
+     - If `success=true`, you have an mp4 at `video_path`.
+  2. Call `extract_frames(video_path, n=4)` to see what the rendered scene actually looks like.
+     INSPECT every frame against the brief's correctness_checks and key_visuals.
+     If anything is wrong (overlap, off-screen text, wrong shape, wrong colour, missing label),
+     fix the code and call render_manim again.
+  3. Call `probe_audio(video_path)` to confirm the voiceover rendered (`has_audio=true`).
+     If the audio is missing, the voiceover blocks are wrong — fix and re-render.
+  4. If a PRIOR SCENE CONTEXT block is present in the brief, call
+     `compare_to_prior_frame(this_frame_path=<your first extracted frame>)`.
+     Read the diff. If a shared object drifted in colour, geometry, position,
+     or label, fix the code and re-render.
+  5. ONLY when the scene renders, the audio is present, the frames look right,
+     and (if applicable) continuity matches the prior scene, call
+     `done(video_path, ending_state_summary)`. The summary is REQUIRED and is
+     handed to the next scene's worker — write it concretely (which mobjects
+     are visible, their positions, colours, labels, camera state).
+
+# TOOL-USE GROUND RULES
+
+- ALWAYS call render_manim before claiming the scene is correct. Never call
+  done without a successful render.
+- Do NOT emit Python code as text in your reply — pass it through the `code`
+  argument of render_manim. Only function calls are valid output.
+- Iterate aggressively: it is normal to call render_manim 3-5 times. Each
+  failed render gives you specific stderr to learn from.
+- Avoid speculative tool calls — don't extract_frames before render_manim
+  succeeds, don't probe_audio twice in a row for the same video.
+- If render fails the same way twice, change strategy (different mobject API,
+  fewer features, simpler animation) — don't loop on the same error.
+- You have a hard ceiling on tool calls per scene. If you near it, prefer to
+  call done with the best successful render you have, including an honest
+  ending_state_summary, rather than running out of budget.
+"""
+
+
 WORKER_SCENE_PROMPT = _BASE_WORKER_PROMPT + "\n\n" + _WORKER_HEADER_OVERRIDE
+WORKER_SCENE_PROMPT_TOOL = WORKER_SCENE_PROMPT + "\n\n" + _WORKER_TOOL_USAGE
 
 
-def build_worker_user_message(item, parent_plan, sub_scene=None) -> str:
+def build_worker_user_message(item, parent_plan, sub_scene=None,
+                              aspect_ratio=None, resolution=None,
+                              prior_context=None) -> str:
     """Compose the per-scene user message for the worker.
 
     Either renders a top-level simple scene (sub_scene=None) or a sub-scene of
     a complex scene (sub_scene provided).
+
+    `aspect_ratio` and `resolution` are surfaced to the LLM so it can compose
+    layouts that fit the target frame (vertical, square, etc.).
+
+    `prior_context` (a PriorContext | None) is surfaced to the worker for
+    sequential runs — it gets the prior scene's ending-state summary and the
+    prior scene's source code (for naming/style consistency). The prior
+    frame image is attached separately as a Part by the caller.
     """
     target = sub_scene if sub_scene is not None else item
     beats = target.beats or []
@@ -214,6 +295,9 @@ def build_worker_user_message(item, parent_plan, sub_scene=None) -> str:
             + "\n"
         )
 
+    aspect_block = _aspect_block(aspect_ratio, resolution)
+    prior_block = _prior_context_block(prior_context)
+
     return f"""SCENE BRIEF
 Topic of the whole video: {parent_plan.topic}
 Title: {parent_plan.title}
@@ -222,7 +306,7 @@ This scene class name MUST be: {scene_class}
 This scene's description: {target.description}
 Target duration: ~{target.target_seconds:.1f} seconds
 Voice: {voice}
-
+{aspect_block}{prior_block}
 Key visuals:
 {visuals or '  (none)'}
 {shared_block}
@@ -233,6 +317,101 @@ Correctness checks the rendered video MUST satisfy:
 {checks or '  (none)'}
 
 Now output the complete Python file for this scene."""
+
+
+def _aspect_block(aspect_ratio, resolution) -> str:
+    """Render an aspect-ratio context block when one was specified.
+
+    Manim's frame_height stays at 8 by default; frame_width scales with the
+    pixel aspect ratio (frame_width = 8 * W / H). Vertical formats produce a
+    very narrow scene-width, so the LLM needs to favour vertical stacking and
+    smaller fonts. We compute frame_width here and pass it explicitly.
+    """
+    if not aspect_ratio:
+        return ""
+    w_px, h_px = resolution if resolution else (None, None)
+    frame_height = 8.0  # Manim default
+    if w_px and h_px:
+        frame_width = round(frame_height * w_px / h_px, 2)
+    else:
+        frame_width = None
+
+    if h_px and w_px and h_px > w_px:
+        orientation = "PORTRAIT — narrow scene-width; stack content vertically and avoid wide horizontal layouts"
+        layout_tips = (
+            "- Frame is taller than it is wide. Prefer VGroup(...).arrange(DOWN) over horizontal arrangements.\n"
+            "- Equations/captions must wrap aggressively; keep each Text under ~25 characters per line.\n"
+            "- Avoid placing mobjects at absolute x-coordinates beyond ±frame_width/2 — they will be off-screen.\n"
+            "- Use `to_edge(UP, buff=0.3)` and `to_edge(DOWN, buff=0.3)` (smaller buff than for landscape)."
+        )
+    elif h_px and w_px and h_px == w_px:
+        orientation = "SQUARE — content should be centered and balanced"
+        layout_tips = (
+            "- Frame is square. Center the main visualization at ORIGIN; keep auxiliary text near the edges.\n"
+            "- Avoid wide horizontal arrangements that work for 16:9.\n"
+            "- Equations should fit in the central ~70% of the frame."
+        )
+    else:
+        orientation = "LANDSCAPE — standard 3Blue1Brown layout"
+        layout_tips = (
+            "- Standard horizontal layout. Title at top, primary visualization in center, captions at bottom."
+        )
+
+    pixel_str = f"{w_px}x{h_px}" if w_px and h_px else "(unspecified)"
+    fw_str = f"{frame_width}" if frame_width is not None else "(default)"
+    return f"""
+Aspect ratio: {aspect_ratio}  ({orientation})
+Pixel resolution: {pixel_str}
+Manim frame: width={fw_str} units, height={frame_height} units (manim default frame_height; frame_width scales with aspect)
+Layout guidance for this aspect:
+{layout_tips}
+"""
+
+
+def _prior_context_block(prior_context) -> str:
+    """Render a PRIOR SCENE CONTEXT block when running sequentially.
+
+    `prior_context` is a `schemas.PriorContext` (or None for the first scene).
+    Emits the ending-state summary as text and the prior scene's full source
+    in a fenced block, so the next worker can match naming, style, and the
+    geometry of any persistent mobjects. The prior frame image is attached
+    separately as a multimodal Part by the worker — this helper does not
+    inline image bytes.
+    """
+    if prior_context is None or not prior_context.ending_state:
+        return ""
+
+    prior_code_text = ""
+    code_path = getattr(prior_context, "prior_code_path", None)
+    if code_path:
+        try:
+            prior_code_text = Path(code_path).read_text()
+        except (OSError, AttributeError):
+            prior_code_text = ""
+
+    image_note = ""
+    if getattr(prior_context, "last_frame_path", None):
+        image_note = (
+            "\nThe LAST FRAME of the previous scene is attached as an image "
+            "earlier in this turn. Match its mobjects' geometry, colour, and "
+            "position when this scene opens, so the cut feels continuous.\n"
+        )
+
+    code_block = ""
+    if prior_code_text:
+        code_block = (
+            "\nPrevious scene source (for naming/style consistency — do NOT "
+            "copy whole-cloth, just match conventions and any persistent "
+            "mobject construction):\n```python\n"
+            + prior_code_text
+            + "\n```\n"
+        )
+
+    return (
+        f"\nPRIOR SCENE CONTEXT (scene {prior_context.prior_scene_id}):\n"
+        f"  ending_state: {prior_context.ending_state}\n"
+        f"{image_note}{code_block}"
+    )
 
 
 def _slug_pascal(slug: str) -> str:

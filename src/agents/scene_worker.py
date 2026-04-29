@@ -18,15 +18,30 @@ from typing import Optional, Union
 from dotenv import load_dotenv
 
 from src.agents.judge import format_judge_hints, judge_scene
-from src.agents.prompts import WORKER_SCENE_PROMPT, build_worker_user_message
+from src.agents.prompts import (
+    WORKER_SCENE_PROMPT,
+    WORKER_SCENE_PROMPT_TOOL,
+    build_worker_user_message,
+)
+from src.agents.scene_worker_tools import (
+    WorkerToolContext,
+    dispatch,
+    get_function_declarations,
+)
 from src.agents.schemas import (
     JudgeReport,
+    PriorContext,
     ScenePlan,
     ScenePlanItem,
     SceneResult,
     SubScene,
 )
-from src.agents.tools import probe_video, render_manim_scene
+from src.agents.tools import (
+    copy_to,
+    extract_last_frame,
+    probe_video,
+    render_manim_scene,
+)
 from src.gemini_agent import _strip_fences, normalize_tts_to_gemini
 
 load_dotenv()
@@ -131,6 +146,8 @@ async def render_scene(
     model: str = "gemini-2.5-pro",
     parent_id: Optional[str] = None,    # parent scene id when rendering a sub-scene
     extra_brief: Optional[str] = None,  # additional repair_brief from master patch
+    resolution: Optional[tuple[int, int]] = None,
+    aspect_ratio: Optional[str] = None,
 ) -> SceneResult:
     """Generate, render, judge, repeat until passed or max_attempts exhausted."""
     project_root = Path(project_root)
@@ -159,11 +176,17 @@ async def render_scene(
     # Build the user-side scene brief once.
     if isinstance(target, SubScene):
         parent_item = next(s for s in plan.scenes if s.id == parent_id)
-        brief = build_worker_user_message(parent_item, plan, sub_scene=target)
+        brief = build_worker_user_message(
+            parent_item, plan, sub_scene=target,
+            aspect_ratio=aspect_ratio, resolution=resolution,
+        )
         # Override expected class name in the brief so the worker uses our path.
         brief = _force_scene_class_in_brief(brief, expected_class)
     else:
-        brief = build_worker_user_message(target, plan)
+        brief = build_worker_user_message(
+            target, plan,
+            aspect_ratio=aspect_ratio, resolution=resolution,
+        )
         brief = _force_scene_class_in_brief(brief, expected_class)
 
     if extra_brief:
@@ -204,7 +227,7 @@ async def render_scene(
         # 2) Render
         render = await asyncio.to_thread(
             render_manim_scene, scene_file, expected_class, quality,
-            None, project_root,
+            None, project_root, resolution,
         )
         if not render.success:
             last_render_log = render.log[-3000:]
@@ -316,3 +339,272 @@ def _force_scene_class_in_brief(brief: str, expected: str) -> str:
 def _persist_attempt_log(artifacts_dir: Path, ident: str, attempt: int, **fields) -> None:
     out = artifacts_dir / f"judge_{ident}_attempt{attempt}.json"
     out.write_text(json.dumps(fields, indent=2, default=str))
+
+
+# ---------------------------------------------------------------------------
+# Tool-driven self-validating worker (sequential pipeline path)
+# ---------------------------------------------------------------------------
+
+async def render_scene_with_tools(
+    target: PlanTarget,
+    plan: ScenePlan,
+    *,
+    run_id: str,
+    quality: str,
+    project_root: Path,
+    prior_context: Optional[PriorContext] = None,
+    judge: bool = True,           # accepted for signature compat; this path
+    n_frames: int = 8,            # uses the model's own inspection instead
+    model: str = "gemini-2.5-pro",
+    parent_id: Optional[str] = None,
+    extra_brief: Optional[str] = None,
+    resolution: Optional[tuple[int, int]] = None,
+    aspect_ratio: Optional[str] = None,
+    max_tool_iterations: int = 8,
+) -> SceneResult:
+    """Self-validating worker: hands tools to Gemini and lets it drive the
+    render → inspect → fix loop until it calls done() or runs out of budget.
+    """
+    project_root = Path(project_root)
+    artifacts_root = project_root / "output" / run_id
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(target, SubScene):
+        parent_slug = next(
+            (s.slug for s in plan.scenes if s.id == parent_id),
+            "scene",
+        )
+        file_stem = f"{parent_slug}__{target.id}_{target.slug}"
+        ident = f"{parent_id}__{target.id}"
+    else:
+        file_stem = target.slug
+        ident = target.id
+
+    expected_class = _slug_to_pascal(file_stem)
+
+    scene_artifacts = artifacts_root / ident
+    scene_artifacts.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(target, SubScene):
+        parent_item = next(s for s in plan.scenes if s.id == parent_id)
+        brief = build_worker_user_message(
+            parent_item, plan, sub_scene=target,
+            aspect_ratio=aspect_ratio, resolution=resolution,
+            prior_context=prior_context,
+        )
+    else:
+        brief = build_worker_user_message(
+            target, plan,
+            aspect_ratio=aspect_ratio, resolution=resolution,
+            prior_context=prior_context,
+        )
+    brief = _force_scene_class_in_brief(brief, expected_class)
+    if extra_brief:
+        brief = brief + f"\n\n# MASTER PATCH NOTES\n{extra_brief}"
+
+    ctx = WorkerToolContext(
+        run_id=run_id,
+        scene_id=ident,
+        project_root=project_root,
+        artifacts_dir=scene_artifacts,
+        expected_class=expected_class,
+        quality=quality,
+        resolution=resolution,
+        prior_context=prior_context,
+        model=model,
+    )
+
+    return await asyncio.to_thread(
+        _drive_tool_loop,
+        ctx, brief, target, ident, file_stem, expected_class,
+        max_tool_iterations,
+    )
+
+
+def _drive_tool_loop(
+    ctx: WorkerToolContext,
+    brief: str,
+    target: PlanTarget,
+    ident: str,
+    file_stem: str,
+    expected_class: str,
+    max_iter: int,
+) -> SceneResult:
+    """Synchronous Gemini function-calling loop. Runs in a worker thread."""
+    from google import genai
+    from google.genai import types
+
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY not set in .env.")
+    client = genai.Client(api_key=api_key)
+
+    declarations = get_function_declarations()
+    tool = types.Tool(function_declarations=declarations)
+
+    user_parts = []
+    pc = ctx.prior_context
+    if pc is not None and pc.last_frame_path is not None:
+        try:
+            img_bytes = Path(pc.last_frame_path).read_bytes()
+            user_parts.append(
+                types.Part.from_bytes(data=img_bytes, mime_type="image/png")
+            )
+        except OSError:
+            pass
+    user_parts.append(types.Part.from_text(text=brief))
+    contents: list = [types.Content(role="user", parts=user_parts)]
+
+    accepted_video: Optional[Path] = None
+    accepted_summary = ""
+    last_done_error: Optional[str] = None
+
+    for _ in range(max_iter):
+        response = client.models.generate_content(
+            model=ctx.model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=WORKER_SCENE_PROMPT_TOOL,
+                tools=[tool],
+                tool_config=types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(mode="ANY")
+                ),
+                temperature=0.4,
+            ),
+        )
+        if not response.candidates:
+            break
+        candidate = response.candidates[0]
+        if candidate.content is None or not candidate.content.parts:
+            break
+
+        contents.append(candidate.content)
+
+        fc_parts = [p for p in candidate.content.parts if getattr(p, "function_call", None)]
+        if not fc_parts:
+            contents.append(types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=(
+                    "Reply with function calls only. Call render_manim, "
+                    "extract_frames, probe_audio, compare_to_prior_frame, "
+                    "or done — never plain text."
+                ))],
+            ))
+            continue
+
+        response_parts = []
+        done_seen = False
+        for p in fc_parts:
+            name = p.function_call.name
+            try:
+                args = dict(p.function_call.args) if p.function_call.args is not None else {}
+            except (TypeError, ValueError):
+                args = {}
+
+            tool_response = dispatch(name, args, ctx)
+            response_parts.append(types.Part.from_function_response(
+                name=name, response=tool_response,
+            ))
+
+            if name == "done":
+                if tool_response.get("accepted"):
+                    accepted_video = Path(tool_response["video_path"])
+                    accepted_summary = tool_response["ending_state_summary"]
+                    done_seen = True
+                else:
+                    last_done_error = tool_response.get("error", "done rejected")
+
+        contents.append(types.Content(role="user", parts=response_parts))
+
+        if done_seen:
+            break
+
+    return _finalize_tool_result(
+        ctx, target, ident, file_stem, expected_class,
+        accepted_video, accepted_summary, last_done_error,
+    )
+
+
+def _finalize_tool_result(
+    ctx: WorkerToolContext,
+    target: PlanTarget,
+    ident: str,
+    file_stem: str,
+    expected_class: str,
+    accepted_video: Optional[Path],
+    accepted_summary: str,
+    last_done_error: Optional[str],
+) -> SceneResult:
+    """Persist the worker's final code, promote the accepted mp4 to the
+    stable scene path, and capture the last frame for the next scene."""
+    scenes_dir = ctx.project_root / "scenes" / ctx.run_id
+    scenes_dir.mkdir(parents=True, exist_ok=True)
+    scene_file = scenes_dir / f"{file_stem}.py"
+    if ctx.last_code:
+        scene_file.write_text(ctx.last_code)
+
+    artifacts_root = ctx.project_root / "output" / ctx.run_id
+    if isinstance(target, SubScene):
+        stable_path = artifacts_root / f"scene_{ident}.mp4"
+    else:
+        stable_path = artifacts_root / f"scene_{target.id}.mp4"
+
+    # Decide outcome:
+    #   - accepted_video set (model called done() and the rendered video passed
+    #     validation) → success
+    #   - ctx.last_render_path exists but no done() call → INCOMPLETE: copy the
+    #     mp4 forward as evidence but mark success=False so plan-mode/QA know
+    #     this isn't a finished scene. Avoids presenting a stale or broken
+    #     render as if the worker were satisfied.
+    #   - nothing rendered at all → hard fail
+    if accepted_video is None:
+        if ctx.last_render_path is not None and ctx.last_render_path.exists():
+            copy_to(ctx.last_render_path, stable_path)
+            last_frame_path: Optional[Path] = ctx.artifacts_dir / "last_frame.png"
+            try:
+                extract_last_frame(stable_path, last_frame_path)
+            except Exception:
+                last_frame_path = None
+            try:
+                duration = probe_video(stable_path).duration
+            except Exception:
+                duration = None
+            return SceneResult(
+                id=ident, scene_class=expected_class, scene_file=scene_file,
+                video_path=stable_path, duration_seconds=duration,
+                attempts=ctx.attempt_idx, success=False,
+                last_error=(
+                    last_done_error
+                    or "max_tool_iterations exceeded — worker never reached done()."
+                    " Last render preserved at video_path for inspection, but the"
+                    " worker did not declare the scene complete."
+                ),
+                last_judge=None,
+                ending_state="",
+                last_frame_path=last_frame_path,
+            )
+        return SceneResult(
+            id=ident, scene_class=expected_class, scene_file=scene_file,
+            video_path=None, duration_seconds=None,
+            attempts=ctx.attempt_idx, success=False,
+            last_error=(ctx.last_log_tail or last_done_error or "no successful render"),
+            last_judge=None,
+            ending_state="",
+            last_frame_path=None,
+        )
+
+    copy_to(accepted_video, stable_path)
+    duration = probe_video(stable_path).duration
+    last_frame_path = ctx.artifacts_dir / "last_frame.png"
+    try:
+        extract_last_frame(stable_path, last_frame_path)
+    except Exception:
+        last_frame_path = None
+    return SceneResult(
+        id=ident, scene_class=expected_class, scene_file=scene_file,
+        video_path=stable_path, duration_seconds=duration,
+        attempts=ctx.attempt_idx, success=True,
+        last_error=None, last_judge=None,
+        ending_state=accepted_summary,
+        last_frame_path=last_frame_path,
+    )

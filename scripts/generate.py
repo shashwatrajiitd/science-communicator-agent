@@ -41,9 +41,13 @@ def _find_rendered_video(scene_class: str) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def _try_render(path: Path, scene_class: str, quality: str) -> tuple[bool, str]:
+def _try_render(path: Path, scene_class: str, quality: str,
+                resolution: tuple[int, int] | None = None) -> tuple[bool, str]:
     import os
-    cmd = ["manim", f"-q{quality}", "--disable_caching", str(path), scene_class]
+    cmd = ["manim", f"-q{quality}", "--disable_caching"]
+    if resolution is not None:
+        cmd.extend(["-r", f"{resolution[0]},{resolution[1]}"])
+    cmd.extend([str(path), scene_class])
     env = os.environ.copy()
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{ROOT}{os.pathsep}{existing}" if existing else str(ROOT)
@@ -52,14 +56,15 @@ def _try_render(path: Path, scene_class: str, quality: str) -> tuple[bool, str]:
 
 
 def _run_simple(topic: str, quality: str, model: str, music: Path | None,
-                preview: bool) -> Path:
+                preview: bool, resolution: tuple[int, int] | None = None) -> Path:
     print(f"[bold cyan]\\[simple\\] Generating scene for:[/] {topic}  [dim](model={model})[/]")
     script = generate_scene(topic, model=model)
     path = save_scene(script, out_dir=ROOT / "scenes")
     print(f"[green]Wrote[/] {path.relative_to(ROOT)} — class [bold]{script.scene_class}[/]")
 
-    print(f"[bold]Rendering[/] {script.scene_class} at -q{quality}")
-    success, output = _try_render(path, script.scene_class, quality)
+    print(f"[bold]Rendering[/] {script.scene_class} at -q{quality}"
+          + (f" -r {resolution[0]},{resolution[1]}" if resolution else ""))
+    success, output = _try_render(path, script.scene_class, quality, resolution)
 
     attempt = 1
     max_repairs = 2
@@ -69,7 +74,7 @@ def _run_simple(topic: str, quality: str, model: str, music: Path | None,
         fixed = repair_scene(broken, output[-2000:], model=model)
         path = save_scene(fixed, out_dir=ROOT / "scenes")
         script = fixed
-        success, output = _try_render(path, script.scene_class, quality)
+        success, output = _try_render(path, script.scene_class, quality, resolution)
         attempt += 1
 
     if not success:
@@ -120,10 +125,84 @@ def main(
     no_decompose: bool = typer.Option(False, "--no-decompose", help="Disable complex-scene splitting"),
     voice: str = typer.Option("", "--voice", help="Override Gemini TTS voice (default from planner)"),
     run_id: str = typer.Option("", "--run-id", help="Override run id (default: timestamp + slug)"),
+    aspect_ratio: str = typer.Option(
+        "16:9", "--aspect-ratio", "--aspect",
+        help="Output aspect ratio: 16:9, 9:16, 1:1, 4:5, etc.",
+    ),
+    parallel: bool = typer.Option(
+        False, "--parallel/--no-parallel",
+        help=(
+            "Render scenes in parallel (legacy mode, no prior-scene context). "
+            "Default is sequential with self-validating tool-use workers."
+        ),
+    ),
+    use_tool_worker: bool = typer.Option(
+        True, "--tool-worker/--no-tool-worker",
+        help=(
+            "Use the Gemini function-calling worker that renders + inspects "
+            "its own output before declaring done. Default on."
+        ),
+    ),
+    max_tool_iterations: int = typer.Option(
+        8, "--max-tool-iterations",
+        help="Hard ceiling on tool calls per scene for the tool-use worker.",
+    ),
+    plan_mode: bool = typer.Option(
+        False, "--plan-mode/--no-plan-mode",
+        help=(
+            "Human-in-the-loop: review the master's plan and every rendered "
+            "scene before continuing. Forces sequential mode."
+        ),
+    ),
+    plan_mode_open: bool = typer.Option(
+        True, "--plan-mode-open/--no-plan-mode-open",
+        help="In --plan-mode, auto-open each rendered scene with the OS opener.",
+    ),
+    plan_mode_max_rounds: int = typer.Option(
+        5, "--plan-mode-max-rounds",
+        help="Cap on revision rounds per plan/scene before auto-accepting.",
+    ),
 ):
+    from src.agents.tools import parse_aspect_ratio, resolution_for
+    try:
+        aspect_tuple = parse_aspect_ratio(aspect_ratio)
+    except ValueError as exc:
+        print(f"[red]{exc}[/]")
+        raise typer.Exit(2)
+    resolution = resolution_for(aspect_tuple, quality)
+    print(f"[dim]aspect_ratio={aspect_ratio}  resolution={resolution[0]}x{resolution[1]}[/]")
+
     if simple:
-        _run_simple(topic, quality, model, music, preview)
+        _run_simple(topic, quality, model, music, preview, resolution=resolution)
         return
+
+    if plan_mode and parallel:
+        raise typer.BadParameter(
+            "--plan-mode requires sequential mode; remove --parallel.",
+            param_hint="--plan-mode",
+        )
+
+    pre_plan_cb = None
+    post_scene_cb = None
+    qa_effective = qa
+    if plan_mode:
+        from src.agents.plan_mode import make_callbacks
+        # Resolve the run_id up front so plan_mode and pipeline use the same
+        # output directory for reviews.jsonl and artifacts.
+        from datetime import datetime
+        import re as _re
+        if not run_id:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            slug = _re.sub(r"[^a-zA-Z0-9]+", "_", topic.lower()).strip("_")[:40] or "video"
+            run_id = f"{ts}_{slug}"
+        pre_plan_cb, post_scene_cb = make_callbacks(
+            model=model, run_id=run_id, project_root=ROOT,
+            auto_open=plan_mode_open, max_rounds=plan_mode_max_rounds,
+        )
+        # In plan-mode the operator has already approved every scene; the QA
+        # pass would second-guess the operator and re-render silently. Force
+        # QA off — there's no useful interactive override here.
+        qa_effective = False
 
     from src.agents.pipeline import run as pipeline_run
     final = asyncio.run(pipeline_run(
@@ -133,13 +212,19 @@ def main(
         parallelism=parallelism,
         max_attempts=max_attempts,
         patch_passes=patch_passes,
-        qa_enabled=qa,
+        qa_enabled=qa_effective,
         judge=judge,
         n_frames=judge_frames,
         allow_decomposition=not no_decompose,
         scene_count_hint=scenes if scenes > 0 else None,
         voice_override=voice or None,
         model=model,
+        aspect_ratio=aspect_ratio,
+        parallel=parallel,
+        use_tool_worker=use_tool_worker,
+        max_tool_iterations=max_tool_iterations,
+        pre_plan_approval=pre_plan_cb,
+        post_scene_approval=post_scene_cb,
     ))
 
     if music:

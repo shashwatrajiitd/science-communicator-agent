@@ -19,7 +19,11 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-from src.agents.prompts import MASTER_PLANNER_PROMPT, MASTER_QA_PROMPT
+from src.agents.prompts import (
+    MASTER_PLAN_REVISION_PROMPT,
+    MASTER_PLANNER_PROMPT,
+    MASTER_QA_PROMPT,
+)
 from src.agents.schemas import (
     QA_REPORT_SCHEMA,
     QAReport,
@@ -101,6 +105,41 @@ def _validate_plan(plan: ScenePlan, allow_decomposition: bool) -> None:
         else:
             if not scene.beats:
                 raise ValueError(f"Simple scene {scene.id} has no beats.")
+
+
+# ---------------------------------------------------------------------------
+# Plan revision (used by --plan-mode)
+# ---------------------------------------------------------------------------
+
+async def revise_plan(plan: ScenePlan, feedback: str, *,
+                      model: str = "gemini-2.5-pro") -> ScenePlan:
+    """Rewrite a ScenePlan in light of one line of operator feedback.
+
+    Re-uses SCENE_PLAN_SCHEMA, so the returned object round-trips through
+    `ScenePlan.from_dict`. The system prompt instructs the model to apply
+    the feedback exactly and preserve everything else.
+    """
+    payload = json.dumps({"plan": plan.to_dict(), "feedback": feedback}, indent=2)
+    json_text = await asyncio.to_thread(_call_revise_plan, model, payload)
+    revised = ScenePlan.from_dict(json.loads(json_text))
+    _validate_plan(revised, allow_decomposition=True)
+    return revised
+
+
+def _call_revise_plan(model: str, payload: str) -> str:
+    from google.genai import types
+    client = _client()
+    response = client.models.generate_content(
+        model=model,
+        contents=payload,
+        config=types.GenerateContentConfig(
+            system_instruction=MASTER_PLAN_REVISION_PROMPT,
+            response_mime_type="application/json",
+            response_schema=SCENE_PLAN_SCHEMA,
+            temperature=0.5,
+        ),
+    )
+    return response.text or "{}"
 
 
 # ---------------------------------------------------------------------------

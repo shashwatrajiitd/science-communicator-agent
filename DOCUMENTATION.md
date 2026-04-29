@@ -37,46 +37,43 @@ There are **two execution paths** in `scripts/generate.py`:
 
 ## 2. High-level architecture
 
-```
-                    ┌──────────────────────────┐
-   topic ────────► │  Master Planner (Gemini)  │  → ScenePlan (JSON)
-                    └────────────┬─────────────┘
-                                 │
-                  ┌──────────────┼─────────────────────────────┐
-                  │              │                             │
-            ┌─────▼─────┐  ┌─────▼─────┐                ┌──────▼──────┐
-            │ Worker 01 │  │ Worker 02 │      …         │  Worker NN  │
-            │ (Gemini)  │  │           │                │             │
-            └─────┬─────┘  └─────┬─────┘                └──────┬──────┘
-                  │              │                             │
-              manim render   manim render                  manim render
-                  │              │                             │
-            ┌─────▼─────┐  ┌─────▼─────┐                ┌──────▼──────┐
-            │  Judge    │  │  Judge    │      …         │   Judge     │
-            │ (vision)  │  │           │                │             │
-            └─────┬─────┘  └─────┬─────┘                └──────┬──────┘
-                  │              │                             │
-                  └──────────────┼─────────────────────────────┘
-                                 │
-                       ┌─────────▼─────────┐
-                       │   ffmpeg concat   │  → final.mp4 (v1)
-                       └─────────┬─────────┘
-                                 │
-                  ┌──────────────▼──────────────┐
-                  │ Master QA  +  Continuity    │  ← deterministic checks +
-                  │  (Gemini, multimodal)       │     vision on adjacent boundaries
-                  └──────────────┬──────────────┘
-                                 │
-                       (issues found?)
-                          │           │
-                        yes           no  → done
-                          │
-            ┌─────────────▼─────────────┐
-            │ Patch failing scenes      │
-            │ (re-run Worker → Judge)   │
-            └─────────────┬─────────────┘
-                          │
-                          └─► re-stitch → loop (up to N patch passes)
+The pipeline is a fan-out / fan-in graph: one planner produces a `ScenePlan`,
+N workers render scenes in parallel each with its own judge gate, then a
+master QA loop iteratively patches scenes that fail post-stitch checks.
+
+```mermaid
+flowchart TD
+    T([topic]) --> P[Master Planner<br/>gemini-2.5-pro]
+    P -->|ScenePlan JSON| FANOUT{{"asyncio.Semaphore<br/>(parallelism=4)"}}
+
+    FANOUT --> W1[Worker 01]
+    FANOUT --> W2[Worker 02]
+    FANOUT --> WN[Worker NN]
+
+    W1 --> R1[manim render]
+    W2 --> R2[manim render]
+    WN --> RN[manim render]
+
+    R1 --> J1[Judge 01<br/>multimodal]
+    R2 --> J2[Judge 02<br/>multimodal]
+    RN --> JN[Judge NN<br/>multimodal]
+
+    J1 --> S[ffmpeg concat]
+    J2 --> S
+    JN --> S
+    S --> V1[/final.mp4 v1/]
+
+    V1 --> QA[Master QA + Continuity<br/>deterministic + vision on<br/>adjacent boundaries]
+    QA -->|overall_ok| DONE([final.mp4])
+    QA -->|issues found| PATCH[Patch failing scenes<br/>re-run Worker → Judge]
+    PATCH --> RES[re-stitch] --> QA
+
+    classDef llm fill:#e1f0ff,stroke:#3b82f6,color:#000
+    classDef io fill:#fef3c7,stroke:#d97706,color:#000
+    classDef artifact fill:#dcfce7,stroke:#16a34a,color:#000
+    class P,J1,J2,JN,QA,W1,W2,WN llm
+    class R1,R2,RN,S,RES io
+    class V1,DONE,T artifact
 ```
 
 Five LLM-driven roles, each implemented as a plain async function around
@@ -147,6 +144,22 @@ output/<run_id>/
 └── final.mp4                     # ← the deliverable
 ```
 
+When each artifact lands during a run:
+
+```mermaid
+flowchart LR
+    P[Phase 1<br/>Plan] -->|writes| A1[plan.json]
+    W[Phase 2<br/>Workers] -->|per attempt| A2[frames_id_attemptN/]
+    W -->|per attempt| A3[judge_id_attemptN.json]
+    W -->|on success| A4[scene_id.mp4]
+    S[Phase 3<br/>Stitch] -->|writes| A5[final.mp4 v1]
+    Q[Phase 4<br/>Master QA loop] -->|writes| A6[continuity_frames/]
+    Q -->|writes| A7[continuity.json]
+    Q -->|each pass| A8[qa.json]
+    Q -->|each pass| A9[patch_log.json]
+    Q -->|overwrites| A5
+```
+
 ---
 
 ## 4. The data model (`src/agents/schemas.py`)
@@ -154,22 +167,68 @@ output/<run_id>/
 Every agent boundary is a dataclass with a matching JSON schema. The schemas
 are passed to Gemini as `response_schema=` so we get back valid JSON.
 
+### Object relationships
+
+```mermaid
+erDiagram
+    SCENEPLAN ||--o{ SCENEPLANITEM : "contains scenes"
+    SCENEPLAN ||--o{ SHAREDOBJECT : "declares"
+    SCENEPLANITEM ||--o{ NARRATIONBEAT : "simple → has beats"
+    SCENEPLANITEM ||--o{ SUBSCENE : "complex → splits into"
+    SUBSCENE ||--o{ NARRATIONBEAT : "has beats"
+    SHAREDOBJECT }o--o{ SCENEPLANITEM : "appears_in"
+    SCENEPLANITEM ||--|| SCENERESULT : "produces"
+    SCENERESULT ||--|| JUDGEREPORT : "last_judge"
+    JUDGEREPORT ||--o{ JUDGEISSUE : "issues"
+    SCENEPLAN ||--o{ QAREPORT : "evaluated by"
+    QAREPORT ||--o{ QAISSUE : "issues"
+```
+
 ### `ScenePlan` — the planner's output
 
-```
-ScenePlan
-├── topic, title, total_target_seconds, voice
-├── scenes: list[ScenePlanItem]
-│   ├── id ("01", "02", …)
-│   ├── slug ("concentric_rings")
-│   ├── description, target_seconds, key_visuals, correctness_checks
-│   ├── complexity: "simple" | "complex"
-│   ├── beats: list[NarrationBeat]      ← when complexity == "simple"
-│   └── sub_scenes: list[SubScene]      ← when complexity == "complex"
-│       └── (each SubScene has its own beats, target_seconds, etc.)
-└── shared_objects: list[SharedObject]  ← cross-scene continuity contract
-    ├── name, color, label, spec
-    └── appears_in: ["03", "04", …]
+```mermaid
+classDiagram
+    class ScenePlan {
+        +str topic
+        +str title
+        +int total_target_seconds
+        +str voice
+        +list~ScenePlanItem~ scenes
+        +list~SharedObject~ shared_objects
+    }
+    class ScenePlanItem {
+        +str id
+        +str slug
+        +str description
+        +int target_seconds
+        +list~str~ key_visuals
+        +list~str~ correctness_checks
+        +Literal complexity
+        +list~NarrationBeat~ beats
+        +list~SubScene~ sub_scenes
+    }
+    class SubScene {
+        +str id
+        +str slug
+        +int target_seconds
+        +list~NarrationBeat~ beats
+    }
+    class NarrationBeat {
+        +str text
+        +str animation_hint
+    }
+    class SharedObject {
+        +str name
+        +str color
+        +str label
+        +str spec
+        +list~str~ appears_in
+    }
+    ScenePlan "1" *-- "many" ScenePlanItem
+    ScenePlan "1" *-- "many" SharedObject
+    ScenePlanItem "1" *-- "many" NarrationBeat : when simple
+    ScenePlanItem "1" *-- "many" SubScene : when complex
+    SubScene "1" *-- "many" NarrationBeat
 ```
 
 A `NarrationBeat` is `(text, animation_hint)` — the `text` is verbatim TTS
@@ -191,18 +250,48 @@ success, last_error, last_judge: JudgeReport)`.
 
 ### `JudgeReport` — per-scene visual gate
 
+```mermaid
+classDiagram
+    class JudgeReport {
+        +bool passed
+        +str overall_assessment
+        +list~JudgeIssue~ issues
+    }
+    class JudgeIssue {
+        +Kind kind
+        +Severity severity
+        +str where
+        +str description
+        +str fix_hint
+    }
+    class Kind {
+        <<enumeration>>
+        text_overlap
+        geometric_error
+        narration_mismatch
+        off_screen
+        wrong_object_count
+        duration_mismatch
+        color_legibility
+        continuity_geometry
+        continuity_color
+        continuity_label
+        continuity_missing
+        continuity_style
+    }
+    class Severity {
+        <<enumeration>>
+        low
+        medium
+        high
+    }
+    JudgeReport "1" *-- "many" JudgeIssue
+    JudgeIssue ..> Kind : kind
+    JudgeIssue ..> Severity : severity
 ```
-JudgeReport
-├── passed: bool
-├── overall_assessment: str
-└── issues: list[JudgeIssue]
-    ├── kind: "text_overlap" | "geometric_error" | "narration_mismatch"
-    │       | "off_screen" | "wrong_object_count" | "duration_mismatch"
-    │       | "color_legibility" | "continuity_*"
-    ├── severity: "low" | "medium" | "high"
-    ├── where, description
-    └── fix_hint  ← actionable, fed back into worker repair
-```
+
+The `fix_hint` field is the load-bearing one — it is fed verbatim back into
+the worker as a repair instruction.
 
 ### `QAReport` — master/global gate
 
@@ -215,6 +304,66 @@ cross-scene concerns (pacing, narrative flow, total-duration drift).
 
 Driver: `src/agents/pipeline.py::run`. All phases are `asyncio` and
 `asyncio.to_thread` wraps every blocking SDK / subprocess call.
+
+### End-to-end sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User (CLI)
+    participant PL as pipeline.run
+    participant MA as master.plan_video
+    participant SR as scene_runner
+    participant SW as scene_worker
+    participant MN as manim (subprocess)
+    participant JU as judge
+    participant FF as ffmpeg
+    participant QA as master.qa_review
+    participant CO as continuity
+
+    U->>PL: generate "topic"
+    PL->>MA: plan_video(topic)
+    MA-->>PL: ScenePlan (persisted plan.json)
+
+    par For each scene (sem=parallelism)
+        PL->>SR: run_scene(item)
+        SR->>SW: render_scene(item)
+        loop up to max_attempts
+            SW->>MN: render Python file
+            alt render fails
+                MN-->>SW: stderr
+                SW->>SW: repair_after_render
+            else render OK
+                SW->>JU: judge(frames, beats, shared_objects)
+                JU-->>SW: JudgeReport
+                alt passed (no medium/high)
+                    SW-->>SR: SceneResult success
+                else failed
+                    SW->>SW: repair_after_judge(fix_hints)
+                end
+            end
+        end
+        SR-->>PL: SceneResult
+    end
+
+    PL->>FF: concat scene_{id}.mp4
+    FF-->>PL: final.mp4 (v1)
+
+    loop up to patch_passes
+        PL->>PL: deterministic_qa(plan, results)
+        PL->>CO: check_continuity(adjacent boundary frames)
+        CO-->>PL: continuity issues
+        PL->>QA: qa_review(plan, results, det+cont)
+        QA-->>PL: QAReport
+        alt overall_ok and no medium/high issues
+            PL->>U: open final.mp4
+        else issues remain
+            PL->>SW: re-render affected scenes (extra_brief)
+            SW-->>PL: patched SceneResults
+            PL->>FF: re-stitch
+        end
+    end
+```
 
 ### Phase 1 — Plan
 
@@ -256,8 +405,11 @@ Inside `scene_worker.render_scene`, for up to `max_attempts` (default 4):
      back to the legacy gTTS pattern from the base system prompt.
 3. **Render** with `tools.render_manim_scene` (subprocess `manim -q<l|m|h|k>
    --disable_caching`, with `PYTHONPATH` set so the generated file can import
-   `src.agents.tts`). The resulting mp4 is copied to a stable path
-   (`output/<run_id>/scene_<id>.mp4`) so later phases can find it.
+   `src.agents.tts`). When `--aspect-ratio` is non-default the resolution
+   computed by `tools.resolution_for` is appended as `-r W,H` and the output
+   is located in the matching `<H>p<fps>/` directory. The resulting mp4 is
+   copied to a stable path (`output/<run_id>/scene_<id>.mp4`) so later phases
+   can find it.
 4. **Judge** (if `--judge`, default on). N frames sampled at evenly-spaced
    midpoints; sent multimodally to Gemini together with the planned beats,
    the description, the `correctness_checks`, and the relevant
@@ -272,6 +424,30 @@ judge wasn't fully satisfied). This guarantees the stitcher can include the
 scene; the master QA loop gets another shot at fixing it.
 
 Every attempt is persisted to `output/<run_id>/judge_<id>_attempt<N>.json`.
+
+#### Per-scene worker state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> GenerateInitial : attempt 1
+    GenerateInitial --> Normalize
+    Normalize --> Render : ensure class name<br/>rewrite gTTS → Gemini
+    Render --> RepairAfterRender : manim non-zero<br/>(stderr → Gemini)
+    RepairAfterRender --> Normalize : new code
+    Render --> Judge : mp4 produced
+    Judge --> Done : passed (no medium/high)
+    Judge --> RepairAfterJudge : medium/high issues
+    RepairAfterJudge --> Normalize : new code
+
+    Render --> BestEffort : attempts exhausted<br/>+ at least one render OK
+    Judge --> BestEffort : attempts exhausted<br/>+ at least one render OK
+    RepairAfterRender --> Failed : attempts exhausted<br/>+ no render ever OK
+    RepairAfterJudge --> BestEffort : attempts exhausted
+
+    Done --> [*]
+    BestEffort --> [*] : success=True<br/>(latest rendered mp4)
+    Failed --> [*] : success=False
+```
 
 ### Phase 3 — Stitch
 
@@ -310,6 +486,30 @@ Up to `--patch-passes` (default 2) iterations of:
 
 Each pass is logged to `output/<run_id>/patch_log.json`. `qa.json` is
 overwritten with the latest report.
+
+#### Patch-loop decision flow
+
+```mermaid
+flowchart TD
+    START([final.mp4 v1]) --> DET[deterministic_qa]
+    DET --> CONT{shared_objects<br/>present?}
+    CONT -- yes --> CC[continuity check<br/>last/first frame pairs]
+    CONT -- no --> QA
+    CC --> QA[master.qa_review]
+    QA --> GATE{overall_ok AND<br/>no medium/high<br/>det+continuity issues?}
+    GATE -- yes --> SHIP([ship final.mp4])
+    GATE -- no --> BUDGET{passes left?}
+    BUDGET -- no --> SHIP
+    BUDGET -- yes --> COLLECT[collect fix_hints<br/>by scene id]
+    COLLECT --> PATCH[re-render affected<br/>scenes in parallel]
+    PATCH --> STITCH[re-stitch]
+    STITCH --> DET
+
+    classDef gate fill:#fee2e2,stroke:#dc2626,color:#000
+    classDef done fill:#dcfce7,stroke:#16a34a,color:#000
+    class GATE,BUDGET,CONT gate
+    class SHIP,START done
+```
 
 ### Optional — background music
 
@@ -387,6 +587,30 @@ multi-agent-specific instructions:
 | Continuity check    | Each patch pass (if shared_objects)   | Last/first-frame comparison for shared objects                  | medium/high → patch          |
 | Master QA           | Each patch pass                       | Cross-scene narrative flow, pacing                              | medium/high → patch          |
 
+### Where each gate sits
+
+```mermaid
+flowchart LR
+    subgraph PerScene["Per-scene loop (worker)"]
+        direction TB
+        G1[Render success] --> G2[Per-scene Judge]
+        G2 -.sub-scenes only.-> G3[Continuity-mode Judge]
+    end
+    subgraph Global["Patch loop (post-stitch)"]
+        direction TB
+        G4[Deterministic QA] --> G5[Continuity check]
+        G5 --> G6[Master QA]
+    end
+    PerScene --> Stitch[ffmpeg concat] --> Global
+    Global -->|issues| PerScene
+    Global -->|clean| Ship([final.mp4])
+
+    classDef hard fill:#fee2e2,stroke:#dc2626,color:#000
+    classDef soft fill:#fef3c7,stroke:#d97706,color:#000
+    class G1,G4 hard
+    class G2,G3,G5,G6 soft
+```
+
 Patch budget: `--patch-passes` (default 2). Per-scene retry budget:
 `--max-attempts` (default 4). When budgets are exhausted the system exits
 with whatever the best-effort fallback produced so the user always gets a
@@ -419,6 +643,368 @@ Common flags:
 | `--music <path>`     | none               | Mix a background music bed under the final    |
 | `--simple`           | off                | Use the legacy single-shot generator instead  |
 | `--preview/--no-preview` | `--preview`    | `open` the final mp4 when done (macOS)        |
+| `--aspect-ratio` / `--aspect` | `16:9`    | Output aspect ratio: `16:9`, `9:16`, `1:1`, `4:5`, `21:9`, … |
+| `--parallel / --no-parallel` | `--no-parallel` | Render scenes in parallel (legacy). Default is sequential. |
+| `--tool-worker / --no-tool-worker` | `--tool-worker` | Use the Gemini function-calling self-validating worker.  |
+| `--max-tool-iterations` | `8`           | Hard ceiling on tool calls per scene (tool-use worker only). |
+
+---
+
+## 9a. Aspect-ratio control
+
+Both pipeline paths accept an `--aspect-ratio` (alias `--aspect`) flag. The
+spec is parsed by `tools.parse_aspect_ratio` (accepts `:`, `x`, or `/` as a
+separator) into a `(W, H)` tuple, and `tools.resolution_for(aspect, quality)`
+maps it to a pixel resolution. Manim is invoked with `-r W,H` and the worker
+brief is augmented with orientation-specific layout guidance.
+
+### Resolution policy
+
+The **short side** is anchored to the `--quality` preset. This matches the
+colloquial meaning of "1080p" (vertical pixels in landscape, horizontal pixels
+in portrait), so `-q h` always gives a "1080p-class" video regardless of
+aspect:
+
+| `--quality`       | short side | 16:9       | 9:16       | 1:1        | 4:5        | 21:9        |
+| ----------------- | ---------- | ---------- | ---------- | ---------- | ---------- | ----------- |
+| `l` (480p15)      | 480 px     | 854×480    | 480×854    | 480×480    | 480×600    | 1120×480    |
+| `m` (720p30)      | 720 px     | 1280×720   | 720×1280   | 720×720    | 720×900    | 1680×720    |
+| `h` (1080p60)     | 1080 px    | 1920×1080  | **1080×1920** | 1080×1080 | 1080×1350 | 2520×1080   |
+| `k` (2160p60)     | 2160 px    | 3840×2160  | 2160×3840  | 2160×2160  | 2160×2700  | 5040×2160   |
+
+The long side is rounded to the nearest even pixel (libx264 requirement).
+
+### How the aspect flows through the pipeline
+
+```mermaid
+flowchart LR
+    CLI["scripts/generate.py<br/>--aspect 9:16 -q h"] -->|aspect_ratio str| PL[pipeline.run]
+    CLI -->|"parse_aspect_ratio<br/>+ resolution_for"| RES["(1080, 1920)"]
+    PL -->|aspect_ratio + resolution| SR[scene_runner.run_scene]
+    SR -->|aspect_ratio + resolution| SW[scene_worker.render_scene]
+    SW -->|aspect_ratio + resolution| BRIEF[build_worker_user_message<br/>+ _aspect_block]
+    SW -->|resolution| TOOL["tools.render_manim_scene<br/>manim ... -r W,H"]
+    BRIEF --> LLM["Gemini worker<br/>(layout-aware code)"]
+    LLM --> SCENE[Manim Scene file]
+    SCENE --> TOOL
+    TOOL --> MP4[scene_id.mp4]
+
+    classDef io fill:#fef3c7,stroke:#d97706,color:#000
+    classDef llm fill:#e1f0ff,stroke:#3b82f6,color:#000
+    classDef artifact fill:#dcfce7,stroke:#16a34a,color:#000
+    class CLI,TOOL io
+    class LLM llm
+    class MP4,SCENE,RES artifact
+```
+
+### Worker layout guidance
+
+`prompts._aspect_block` injects a context block into the per-scene brief.
+Manim keeps `frame_height = 8.0` and scales `frame_width = 8 * W / H`, so
+portrait formats produce a much narrower scene-width that can break the
+default 3Blue1Brown layout. The block surfaces:
+
+- the chosen aspect ratio + pixel resolution,
+- the resulting Manim `frame_width` in scene units (e.g. `4.5` for 9:16,
+  `8.0` for 1:1, `14.22` for 16:9),
+- orientation-specific tips:
+  - **portrait** → favour `VGroup(...).arrange(DOWN)`, wrap text to ~25 chars,
+    avoid absolute x-coords beyond `±frame_width/2`, smaller `to_edge` buff;
+  - **square** → center the main visualization at `ORIGIN`, fit equations
+    inside the central ~70%;
+  - **landscape** → standard horizontal layout (status quo).
+
+These hints land in the same brief that already carries beats, key visuals,
+correctness checks, and shared-objects specs, so the LLM treats them as
+first-class layout constraints rather than free-form advice.
+
+---
+
+## 9b. Sequential pipeline + self-validating tool-use worker
+
+The default pipeline (since v2) runs scenes **sequentially** and gives every
+worker a Gemini **function-calling toolbelt** so it can render and inspect its
+own output before declaring done. The legacy parallel path is still available
+behind `--parallel` for fast batch runs that don't need cross-scene continuity.
+
+### Why sequential
+
+Workers used to fly blind across scene boundaries. The asyncio.gather path
+means scene N+1 starts before scene N finishes — its prompt has no idea what
+mobjects are on screen at the cut, what naming conventions the prior worker
+chose, or what camera state to inherit. The post-hoc continuity check in
+`continuity.py` catches drift, but only after every scene has already been
+rendered (and re-rendering is what we're trying to avoid).
+
+In sequential mode (`pipeline._run_sequential`) each scene completes before
+the next starts; on success we capture an `ending_state` summary (the model
+writes it as the argument to its `done()` tool call) and the last frame of
+the rendered video, and hand both to the next worker.
+
+### Why tool-use
+
+The text-only worker in `scene_worker.render_scene` is a 4-attempt loop:
+generate code → render → if failure, send the stderr back as text → regenerate.
+The model never sees the rendered video, just an error message. Geometric
+problems ("the triangle came out as a parallelogram"), missing audio, or
+continuity drift can only be flagged by the downstream judge — too late.
+
+`scene_worker.render_scene_with_tools` flips this. The model gets a Gemini
+`Tool` with five `FunctionDeclaration`s and is forced into `mode=ANY` (no
+free-text replies). It iterates: render, inspect frames, probe audio, compare
+to prior frame, fix, re-render — until it calls `done(video_path, summary)`.
+
+### Tool inventory
+
+Defined in `src/agents/scene_worker_tools.py`:
+
+| Tool | Returns | Use |
+|------|---------|------|
+| `render_manim(code, scene_class)` | `success`, `log_tail`, `video_path`, `duration_s` | Write code to fresh attempt dir, run manim |
+| `extract_frames(video_path, n)` | list of `{t_seconds, path}` | Sample N PNGs to inspect |
+| `probe_audio(video_path)` | `has_audio`, `duration_s` | Verify voiceover rendered |
+| `compare_to_prior_frame(this_frame_path)` | `diff_summary` (text) | Vision-diff vs prior scene's last frame |
+| `done(video_path, ending_state_summary)` | `accepted` (bool) | Terminal — required to exit the loop |
+
+Each call lands in `output/<run_id>/<scene_id>/attempts/<NN>/`:
+
+```
+attempts/01/
+  scene.py        # the code passed to render_manim
+  scene.mp4       # rendered video (if success)
+  log_tail.txt    # last 2000 chars of manim stdout/stderr
+  frames/         # extract_frames output
+```
+
+The hard ceiling is `--max-tool-iterations` (default 8). On exhaustion, the
+worker returns the most recent successful render as best-effort with an empty
+`ending_state` (so the next scene's continuity hint is degraded but the run
+still completes).
+
+### Prior-context handoff
+
+`schemas.PriorContext` is the payload threaded between scenes:
+
+```python
+PriorContext(
+    prior_scene_id="01",
+    last_frame_path=Path(".../output/<run_id>/01/last_frame.png"),
+    ending_state="Blue circle of radius 2 centred at ORIGIN; label 'r=2' below.",
+    prior_code_path=Path(".../scenes/<run_id>/show_circle.py"),
+)
+```
+
+`prompts._prior_context_block` injects the ending-state text and the prior
+scene's full Python source into the next worker's brief. The last frame is
+attached separately as a multimodal `Part.from_bytes` so the model literally
+sees what the previous scene faded to. The prior code helps the worker match
+naming and mobject construction conventions so persistent objects stay visually
+identical.
+
+### Sequential vs parallel — flow comparison
+
+```mermaid
+flowchart LR
+    subgraph Sequential["Sequential (default) — pipeline._run_sequential"]
+        S0[plan_video] --> S1[scene 01<br/>tool worker]
+        S1 -->|"PriorContext<br/>(last_frame, ending_state, code)"| S2[scene 02<br/>tool worker]
+        S2 -->|"PriorContext"| S3[scene 03<br/>tool worker]
+        S3 --> S4[stitch + QA]
+    end
+
+    subgraph Parallel["Parallel (--parallel) — pipeline.run gather"]
+        P0[plan_video] --> P1[scene 01]
+        P0 --> P2[scene 02]
+        P0 --> P3[scene 03]
+        P1 --> P4[stitch + QA + continuity check<br/>post-hoc]
+        P2 --> P4
+        P3 --> P4
+    end
+```
+
+### Tool-use loop (per scene)
+
+```mermaid
+sequenceDiagram
+    participant W as Worker (scene_worker_tools.dispatch)
+    participant G as Gemini (mode=ANY)
+    participant M as Manim subprocess
+    participant FF as ffmpeg/ffprobe
+
+    Note over W,G: brief (text) + prior frame (image) + system prompt
+    G->>W: render_manim(code, scene_class)
+    W->>M: write code, run manim
+    M-->>W: stdout/stderr + mp4 path
+    W-->>G: {success, log_tail, video_path, duration_s}
+
+    alt success
+        G->>W: extract_frames(video_path, n=4)
+        W->>FF: ffmpeg -ss t -frames:v 1 ...
+        FF-->>W: PNG paths
+        W-->>G: [{t_seconds, path}, ...]
+
+        G->>W: compare_to_prior_frame(first_frame)
+        W->>G: (mini vision call: prior vs this)
+        G-->>W: diff_summary text
+        W-->>G: {diff_summary}
+
+        G->>W: done(video_path, ending_state_summary)
+        W-->>G: {accepted: true}
+    else failure
+        Note over G: read log_tail, fix code, call render_manim again
+    end
+```
+
+### CLI summary
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| (none — sequential is default) | sequential | Scenes rendered one at a time, prior-context threaded |
+| `--parallel` | off | Restore legacy `asyncio.gather` path; no prior context |
+| `--tool-worker` (default on) | on | Use the function-calling worker |
+| `--no-tool-worker` | — | Fall back to legacy text-only repair worker (still useful with `--parallel`) |
+| `--max-tool-iterations` | `8` | Cap on tool calls per scene |
+
+### Hooks for `--plan-mode`
+
+`pipeline.run` accepts two optional callables, both defaulting to no-op pass-
+through. `--plan-mode` (§9c) wires them up; you can also build your own
+callbacks for non-CLI contexts (notebooks, web UI):
+
+- `pre_plan_approval(plan: ScenePlan) -> ScenePlan` — fired after the planner
+  returns. Whatever the callback returns becomes the working plan.
+- `post_scene_approval(item, result, rerun) -> SceneResult` — fired after
+  each scene completes in sequential mode. `rerun(extra_brief)` is a closure
+  the pipeline injects so the callback can request re-renders without
+  needing the rest of the run-state. Callable accepts a `str | None`
+  (additional brief / no-op retry) and returns the new `SceneResult`.
+
+Both callables can be sync or async — `pipeline._maybe_await` handles either.
+
+---
+
+## 9c. `--plan-mode`: human-in-the-loop review
+
+The default sequential pipeline (§9b) is fully autonomous. `--plan-mode`
+swaps in two interactive gates:
+
+1. **Plan gate** — review the planner's output before any rendering starts.
+2. **Per-scene gate** — review every rendered scene before the next starts.
+
+Both gates loop until you approve (or hit a 5-round revision cap, or quit).
+
+```bash
+python scripts/generate.py "Why does pi appear in a Gaussian?" --plan-mode
+python scripts/generate.py "..." --plan-mode --no-plan-mode-open  # SSH-friendly
+```
+
+`--plan-mode` requires sequential mode; passing `--parallel` together is
+rejected at CLI parse time.
+
+### Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant U as Operator
+    participant CLI as scripts/generate.py
+    participant PM as plan_mode (callbacks)
+    participant P as pipeline.run
+    participant M as master.plan_video / revise_plan
+    participant W as scene worker (tool-use)
+
+    U->>CLI: --plan-mode "topic"
+    CLI->>PM: make_callbacks(model, run_id, ...)
+    PM-->>CLI: (pre_plan, post_scene)
+    CLI->>P: run(parallel=False, pre_plan=..., post_scene=...)
+
+    P->>M: plan_video(topic)
+    M-->>P: ScenePlan v1
+    P->>PM: pre_plan_approval(plan)
+
+    loop until approved or cap
+        PM->>U: rich table (plan)
+        U-->>PM: a / c <comment> / q
+        alt comment
+            PM->>M: revise_plan(plan, comment)
+            M-->>PM: ScenePlan v2
+        end
+    end
+    PM-->>P: approved plan
+
+    loop per scene (sequential)
+        P->>W: run_scene(item, plan, prior_context)
+        W-->>P: SceneResult
+        P->>PM: post_scene_approval(item, result, rerun)
+
+        loop until approved or cap
+            PM->>U: panel + auto-open mp4
+            U-->>PM: a / c <comment> / r / q
+            alt comment or retry
+                PM->>P: rerun(extra_brief=...)
+                P->>W: run_scene(... extra_brief)
+                W-->>P: SceneResult'
+                P-->>PM: SceneResult'
+            end
+        end
+        PM-->>P: approved result
+    end
+
+    P->>P: stitch + (optional) QA
+    P-->>CLI: final.mp4
+    CLI->>U: print path
+```
+
+### CLI surface
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--plan-mode` | off | Enable both gates. Forces `--no-parallel` and force-disables QA. |
+| `--no-plan-mode-open` | (off when `--plan-mode-open` is on) | Suppress the `open <path>` call when each scene renders. |
+| `--plan-mode-max-rounds N` | `5` | Cap on revision rounds per plan/scene. |
+| `--qa` (with `--plan-mode`) | ignored | QA is force-off in plan-mode; you've already approved each scene. |
+
+### Action keys
+
+| Key | Plan gate | Scene gate |
+|-----|-----------|-----------|
+| `a` | approve plan, continue to render | approve scene, continue to next |
+| `c` | comment + revise plan via LLM | comment + re-render scene |
+| `r` | — | retry scene without a comment |
+| `q` | abort with exit code 2 | abort with exit code 2 |
+
+Either the literal letter or the prefix of the label works (`approve`, `comm`,
+etc.). Pressing Enter takes the default (`a`).
+
+### Persistence
+
+Every action is appended to `output/<run_id>/reviews.jsonl`:
+
+```jsonl
+{"ts": "2026-04-29T18:30:00Z", "phase": "plan", "scene_id": null, "action": "comment", "comment": "make scene 02 shorter"}
+{"ts": "...", "phase": "plan", "scene_id": null, "action": "approve", "comment": null}
+{"ts": "...", "phase": "scene", "scene_id": "01", "action": "approve", "comment": null}
+{"ts": "...", "phase": "scene", "scene_id": "02", "action": "comment", "comment": "shrink the square"}
+{"ts": "...", "phase": "scene", "scene_id": "02", "action": "approve", "comment": null}
+```
+
+Used today only as an audit trail. Resumability across runs and backtracking
+to earlier scenes are deferred.
+
+### Gotchas
+
+- **Rendering takes minutes.** Each scene's tool-use loop typically does 1–3
+  manim renders, each ~30–120s at `--quality l`. Plan-mode adds prompts but
+  doesn't change render cost.
+- **API spend on tight comment loops.** Each plan revision is one Gemini
+  call; each scene re-render with a comment can be 4–8 Gemini calls plus
+  TTS. The 5-round cap protects you from a runaway loop, but a deliberate 5
+  rounds × 4 scenes is still ~80 Gemini calls.
+- **macOS-only auto-open.** `open <path>` is macOS; `xdg-open <path>` is the
+  Linux fallback. Other platforms silently skip.
+- **stdin in non-tty contexts.** `typer.prompt` reads from stdin. You can
+  pipe approvals (`printf 'a\na\n' | python scripts/generate.py ...`) but
+  most users will run interactively. `--plan-mode` over SSH works as long as
+  you have stdin and don't need auto-open (`--no-plan-mode-open`).
 
 ---
 
@@ -440,23 +1026,7 @@ System dependencies: `cairo`, `pango`, `ffmpeg`, optionally `MacTeX` /
 
 ---
 
-## 11. Progress so far (commit history)
-
-```
-3798151  Few fixes
-f3dcc9c  Temoral Knowledge
-f3f2994  Mutli-Agent System Added
-```
-
-Three commits to date:
-
-1. **`f3f2994` — Multi-agent system added.** The architectural leap from
-   single-shot generation to the planner / worker / judge / QA pipeline
-   described in this doc.
-2. **`f3dcc9c` — Temporal knowledge.** Cross-scene continuity work —
-   `SharedObject` schema, the continuity agent, judge awareness of shared
-   objects, master-QA integration of continuity issues.
-3. **`3798151` — Few fixes.** Stabilisation pass.
+## 11. Test cases and legacy scenes
 
 The working tree under `scenes/` shows several runs already produced under
 the new pipeline (timestamped run-id directories from `2026-04-29`), each a
@@ -522,6 +1092,14 @@ manim -pql scenes/example.py SquareToCircle
 # Generate a video with the multi-agent pipeline
 python scripts/generate.py "Show why the area of a circle is pi r squared" \
     --quality l --parallelism 4 --patch-passes 2
+
+# Generate vertically (Shorts / Reels / TikTok) at 1080×1920
+python scripts/generate.py "Why does pi appear in a Gaussian?" \
+    --aspect 9:16 --quality h
+
+# Square (1:1) or 4:5 for Instagram-style feeds
+python scripts/generate.py "..." --aspect 1:1 --quality h
+python scripts/generate.py "..." --aspect 4:5 --quality h
 
 # Or fall back to the single-shot legacy generator
 python scripts/generate.py "Explain Euler's identity" --simple

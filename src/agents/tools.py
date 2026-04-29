@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -29,6 +30,53 @@ QUALITY_DIRS = {
     "k": "2160p60",
 }
 
+# Pixels along the SHORT side of the frame for each quality preset. We anchor
+# the short side (rather than height) so portrait formats like 9:16 produce
+# 1080x1920 at -qh — matching the colloquial meaning of "1080p".
+QUALITY_SHORT_SIDE = {"l": 480, "m": 720, "h": 1080, "k": 2160}
+QUALITY_FPS = {"l": 15, "m": 30, "h": 60, "k": 60}
+
+
+def parse_aspect_ratio(spec: str) -> tuple[int, int]:
+    """Parse an aspect ratio like '16:9', '9:16', '1:1', '4:5'.
+
+    Accepts ':', 'x', or '/' as the separator. Raises ValueError on
+    malformed input or a zero/negative component.
+    """
+    s = (spec or "").strip().lower()
+    parts = re.split(r"[:x/]", s)
+    if len(parts) != 2:
+        raise ValueError(f"Invalid aspect ratio {spec!r}; expected forms like '16:9'.")
+    try:
+        a, b = int(parts[0]), int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"Invalid aspect ratio {spec!r}; non-integer component.") from exc
+    if a <= 0 or b <= 0:
+        raise ValueError(f"Invalid aspect ratio {spec!r}; components must be positive.")
+    return a, b
+
+
+def resolution_for(aspect: tuple[int, int], quality: str) -> tuple[int, int]:
+    """Pixel (width, height) for the given aspect ratio + manim quality preset.
+
+    The short side is anchored at the quality preset's pixel count (480/720/
+    1080/2160). The long side is scaled and rounded to an even number so x264
+    is happy.
+    """
+    aw, ah = aspect
+    short = QUALITY_SHORT_SIDE.get(quality, 480)
+    if aw >= ah:
+        # landscape or square: short side is height
+        h = short
+        w = int(round(short * aw / ah))
+    else:
+        # portrait: short side is width
+        w = short
+        h = int(round(short * ah / aw))
+    if w % 2: w += 1
+    if h % 2: h += 1
+    return w, h
+
 
 @dataclass
 class RenderResult:
@@ -39,7 +87,8 @@ class RenderResult:
 
 def render_manim_scene(scene_file: Path, scene_class: str, quality: str = "l",
                        extra_args: Optional[list[str]] = None,
-                       project_root: Optional[Path] = None) -> RenderResult:
+                       project_root: Optional[Path] = None,
+                       resolution: Optional[tuple[int, int]] = None) -> RenderResult:
     """Render one Manim Scene class to mp4. Returns the path on success.
 
     Caching is disabled so re-renders pick up code changes. The scene's
@@ -47,12 +96,19 @@ def render_manim_scene(scene_file: Path, scene_class: str, quality: str = "l",
 
     The render subprocess is given a PYTHONPATH that includes the project
     root, so generated scenes can `from src.agents.tts import GeminiTTSService`.
+
+    If `resolution=(W, H)` is provided, manim is invoked with `-r W,H` and the
+    output directory becomes `<H>p<fps>` instead of the default quality dir.
     """
     scene_file = Path(scene_file)
     if project_root is None:
         project_root = _infer_project_root(scene_file)
 
-    cmd = ["manim", f"-q{quality}", "--disable_caching", str(scene_file), scene_class]
+    cmd = ["manim", f"-q{quality}", "--disable_caching"]
+    if resolution is not None:
+        w, h = resolution
+        cmd.extend(["-r", f"{w},{h}"])
+    cmd.extend([str(scene_file), scene_class])
     if extra_args:
         cmd.extend(extra_args)
 
@@ -68,7 +124,10 @@ def render_manim_scene(scene_file: Path, scene_class: str, quality: str = "l",
     if proc.returncode != 0:
         return RenderResult(success=False, log=log, video_path=None)
 
-    quality_dir = QUALITY_DIRS.get(quality, "480p15")
+    if resolution is not None:
+        quality_dir = f"{resolution[1]}p{QUALITY_FPS.get(quality, 15)}"
+    else:
+        quality_dir = QUALITY_DIRS.get(quality, "480p15")
     expected = project_root / "media" / "videos" / scene_file.stem / quality_dir / f"{scene_class}.mp4"
     if not expected.exists():
         media_videos = project_root / "media" / "videos"
@@ -157,6 +216,43 @@ def extract_frames(video_path: Path, n: int, out_dir: Path) -> list[Path]:
         if proc.returncode == 0 and out.exists():
             frames.append(out)
     return frames
+
+
+def extract_last_frame(video_path: Path, out_path: Path) -> Path:
+    """Extract the final frame of a video as a PNG.
+
+    Used by the sequential pipeline to hand the prior scene's last frame to
+    the next scene's worker. We seek from end-of-file to grab whatever frame
+    is closest to the actual final visual frame; the exact offset varies
+    because manim sometimes appends silent audio without extending the video
+    track.
+    """
+    video_path = Path(video_path)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Try -sseof first (seek relative to end). Falls back to absolute seek
+    # at duration - 0.3s, then to a middle-frame snapshot if both fail.
+    attempts = [
+        ["-sseof", "-0.5"],
+    ]
+    duration = probe_video(video_path).duration
+    if duration > 0.3:
+        attempts.append(["-ss", f"{duration - 0.3:.3f}"])
+    if duration > 0:
+        attempts.append(["-ss", f"{duration / 2:.3f}"])
+
+    last_err = ""
+    for seek_args in attempts:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", *seek_args, "-i", str(video_path),
+             "-frames:v", "1", "-q:v", "2", str(out_path)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+            return out_path
+        last_err = (proc.stderr or "")[-500:]
+    raise RuntimeError(f"extract_last_frame failed: {last_err}")
 
 
 def extract_audio(video_path: Path, out_path: Path) -> Path:

@@ -182,9 +182,27 @@ class SceneResult:
     success: bool
     last_error: Optional[str] = None
     last_judge: Optional[JudgeReport] = None
+    # Sequential-mode handoff. Populated when the worker calls done(...)
+    # with an ending-state summary, plus a frame extracted from the very end
+    # of the rendered scene. Both feed into PriorContext for scene N+1.
+    ending_state: str = ""
+    last_frame_path: Optional[Path] = None
 
     def to_dict(self) -> dict:
         return _to_serializable(asdict(self))
+
+
+@dataclass
+class PriorContext:
+    """Handoff payload for the worker generating scene N+1.
+
+    Populated from the prior successful SceneResult in pipeline._run_sequential.
+    None for the first scene of a run (or after a failed predecessor).
+    """
+    prior_scene_id: Optional[str]
+    last_frame_path: Optional[Path]
+    ending_state: str
+    prior_code_path: Optional[Path]
 
 
 # ---------------------------------------------------------------------------
