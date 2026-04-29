@@ -115,6 +115,10 @@ def render_manim_scene(scene_file: Path, scene_class: str, quality: str = "l",
     env = os.environ.copy()
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{project_root}{os.pathsep}{existing}" if existing else str(project_root)
+    # Manim shells out to `latex`/`dvisvgm` for MathTex/Tex objects. If the
+    # user's interactive PATH doesn't include the TeX install, the manim
+    # subprocess will see FileNotFoundError. Detect TeX once and prepend.
+    env["PATH"] = _augment_path_with_tex(env.get("PATH", ""))
 
     # cwd=project_root so the manim media/ dir lands in the project, not in
     # whatever directory the caller happened to be in.
@@ -159,6 +163,40 @@ def _infer_project_root(scene_file: Path) -> Path:
         if (ancestor / "requirements.txt").exists() or (ancestor / "pyproject.toml").exists():
             return ancestor
     return scene_file.resolve().parent.parent
+
+
+_TEX_PATH_CANDIDATES = [
+    "/Library/TeX/texbin",
+    "/usr/local/texlive/2026/bin/universal-darwin",
+    "/usr/local/texlive/2025/bin/universal-darwin",
+    "/usr/local/texlive/2024/bin/universal-darwin",
+    "/usr/local/texlive/2023/bin/universal-darwin",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+]
+
+
+def _augment_path_with_tex(current_path: str) -> str:
+    """Return PATH with a TeX bin directory prepended, if one exists.
+
+    Manim shells out to `latex`/`dvisvgm` for MathTex/Tex; if those binaries
+    aren't on PATH the subprocess fails with FileNotFoundError. The user's
+    interactive shell PATH (~/.zshrc etc.) is not always inherited by
+    subprocess invocations — most often the case when the parent Python
+    was launched from a desktop app or a bare login shell. We fall back to
+    a small list of well-known install locations on macOS.
+    """
+    if shutil.which("latex"):
+        return current_path  # already discoverable
+    parts = current_path.split(os.pathsep) if current_path else []
+    for candidate in _TEX_PATH_CANDIDATES:
+        if candidate in parts:
+            continue
+        latex_bin = Path(candidate) / "latex"
+        if latex_bin.exists():
+            parts.insert(0, candidate)
+            return os.pathsep.join(parts)
+    return current_path
 
 
 # ---------------------------------------------------------------------------

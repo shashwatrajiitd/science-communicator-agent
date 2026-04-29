@@ -19,6 +19,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
+from src.agents.log import info, log
 from src.agents.prompts import (
     MASTER_PLAN_REVISION_PROMPT,
     MASTER_PLANNER_PROMPT,
@@ -50,6 +51,8 @@ async def plan_video(topic: str, *, model: str = "gemini-2.5-pro",
                      scene_count_hint: Optional[int] = None,
                      allow_decomposition: bool = True) -> ScenePlan:
     """Ask Gemini for a structured ScenePlan."""
+    info("planner", f"plan_video starting — topic={topic!r}  model={model}  "
+                    f"scene_count_hint={scene_count_hint}  decompose={allow_decomposition}")
     user_msg = f"Topic: {topic}"
     if scene_count_hint:
         user_msg += f"\nTarget number of top-level scenes: {scene_count_hint}"
@@ -60,6 +63,8 @@ async def plan_video(topic: str, *, model: str = "gemini-2.5-pro",
     data = json.loads(json_text)
     plan = ScenePlan.from_dict(data)
     _validate_plan(plan, allow_decomposition)
+    info("planner", f"plan_video done — title={plan.title!r}  scenes={len(plan.scenes)}  "
+                    f"voice={plan.voice}  total_target={plan.total_target_seconds:.0f}s")
     return plan
 
 
@@ -119,10 +124,13 @@ async def revise_plan(plan: ScenePlan, feedback: str, *,
     `ScenePlan.from_dict`. The system prompt instructs the model to apply
     the feedback exactly and preserve everything else.
     """
+    fb_short = (feedback or "")[:120] + ("…" if len(feedback or "") > 120 else "")
+    info("planner", f"revise_plan starting — feedback={fb_short!r}  model={model}")
     payload = json.dumps({"plan": plan.to_dict(), "feedback": feedback}, indent=2)
     json_text = await asyncio.to_thread(_call_revise_plan, model, payload)
     revised = ScenePlan.from_dict(json.loads(json_text))
     _validate_plan(revised, allow_decomposition=True)
+    info("planner", f"revise_plan done — title={revised.title!r}  scenes={len(revised.scenes)}")
     return revised
 
 
@@ -150,13 +158,18 @@ async def qa_review(plan: ScenePlan, results: list[dict],
                     deterministic_issues: list[dict],
                     *, model: str = "gemini-2.5-pro") -> QAReport:
     """Run the master QA pass. `results` is list of SceneResult.to_dict()."""
+    info("qa", f"qa_review starting — scenes={len(results)}  "
+               f"deterministic_issues={len(deterministic_issues)}  model={model}")
     user_msg = json.dumps({
         "plan": plan.to_dict(),
         "results": results,
         "deterministic_issues": deterministic_issues,
     }, indent=2)
     json_text = await asyncio.to_thread(_call_qa, model, user_msg)
-    return QAReport.from_dict(json.loads(json_text))
+    report = QAReport.from_dict(json.loads(json_text))
+    info("qa", f"qa_review done — overall_ok={report.overall_ok}  "
+               f"issues={len(report.issues)}")
+    return report
 
 
 def _call_qa(model: str, user_msg: str) -> str:

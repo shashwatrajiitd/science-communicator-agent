@@ -27,6 +27,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from src.agents.log import info as _log_info
 from src.agents.master import revise_plan
 from src.agents.schemas import ScenePlan, ScenePlanItem, SceneResult
 
@@ -301,10 +302,13 @@ def _prompt_action(choices: list[str], *, default: str,
     """Read one keypress-style choice from the operator.
 
     Uses typer.prompt; accepts the literal letter or the full label. Returns
-    a single lowercase character from `choices`.
+    a single lowercase character from `choices`. After 5 invalid inputs in a
+    row (e.g. someone piping `yes a` while approve is disabled), gives up
+    and returns the default to avoid an unbreakable loop.
     """
     legend = "  ".join(rf"\[{c}]={labels.get(c, c)}" for c in choices)
     _console.print(f"[bold]Choose:[/] {legend}")
+    invalid_streak = 0
     while True:
         raw = typer.prompt(f"action [{default}]", default=default).strip().lower()
         if not raw:
@@ -315,6 +319,13 @@ def _prompt_action(choices: list[str], *, default: str,
         for c in choices:
             if labels.get(c, "").lower().startswith(raw):
                 return c
+        invalid_streak += 1
+        if invalid_streak >= 5:
+            _console.print(
+                f"[yellow]Got {invalid_streak} invalid inputs in a row; "
+                f"defaulting to {default!r}.[/]"
+            )
+            return default
         _console.print(f"[yellow]Unknown choice {raw!r}. Try one of: {choices}[/]")
 
 
@@ -335,6 +346,12 @@ def _append_review(path: Path, **fields) -> None:
     }
     with path.open("a") as f:
         f.write(json.dumps(payload) + "\n")
+    # Mirror to the live console log so the operator can scan the action
+    # stream alongside the worker tool calls.
+    scope = "review:plan" if fields.get("phase") == "plan" else f"review:{fields.get('scene_id') or '?'}"
+    comment = fields.get("comment")
+    suffix = f" — {comment[:80]}{'…' if comment and len(comment) > 80 else ''}" if comment else ""
+    _log_info(scope, f"{fields.get('action')}{suffix}")
 
 
 def _maybe_open(path: Path) -> None:

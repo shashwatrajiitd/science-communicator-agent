@@ -965,15 +965,36 @@ sequenceDiagram
 
 ### Action keys
 
-| Key | Plan gate | Scene gate |
-|-----|-----------|-----------|
-| `a` | approve plan, continue to render | approve scene, continue to next |
-| `c` | comment + revise plan via LLM | comment + re-render scene |
-| `r` | — | retry scene without a comment |
-| `q` | abort with exit code 2 | abort with exit code 2 |
+| Key | Plan gate | Scene gate (clean render) | Scene gate (failed render) |
+|-----|-----------|---------------------------|----------------------------|
+| `a` | approve plan, continue to render | approve scene, continue to next | **disabled** |
+| `c` | comment + revise plan via LLM | comment + re-render scene | comment + re-render scene |
+| `r` | — | retry scene without a comment | retry scene without a comment |
+| `q` | abort with exit code 2 | abort with exit code 2 | abort with exit code 2 |
 
 Either the literal letter or the prefix of the label works (`approve`, `comm`,
-etc.). Pressing Enter takes the default (`a`).
+etc.). Pressing Enter takes the default (`a` for clean renders, `r` for failed).
+
+### Clean-render gate
+
+Approve is disabled until the worker produces an mp4 that meets all of:
+1. `result.success == True` (the tool-use worker called `done(...)` and the
+   render passed validation).
+2. `result.video_path` exists and is non-empty.
+
+The `done(video_path, ending_state_summary)` tool itself enforces a stricter
+check before accepting:
+- video file exists, ≥ 1 KB
+- `ffprobe` reads it without error
+- duration ≥ 0.5s
+- audio track is present (manim_voiceover wired correctly)
+
+If any of these fail, `done(...)` returns `accepted=false` with a specific
+error message. The model is expected to read the error, fix the code, and
+call `render_manim` again. The model only returns to plan-mode after a
+successful `done(...)`. If `--max-tool-iterations` exhausts without a clean
+render, the worker returns `success=False` and plan-mode forces retry/quit
+rather than presenting a half-broken scene.
 
 ### Persistence
 

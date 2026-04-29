@@ -18,6 +18,7 @@ from typing import Optional, Union
 from dotenv import load_dotenv
 
 from src.agents.judge import format_judge_hints, judge_scene
+from src.agents.log import info, log, log_tool_call, log_tool_response, warn
 from src.agents.prompts import (
     WORKER_SCENE_PROMPT,
     WORKER_SCENE_PROMPT_TOOL,
@@ -385,6 +386,11 @@ async def render_scene_with_tools(
     scene_artifacts = artifacts_root / ident
     scene_artifacts.mkdir(parents=True, exist_ok=True)
 
+    info(f"worker:{ident}",
+         f"render_scene_with_tools — class={expected_class}  target={target.target_seconds:.0f}s  "
+         f"prior={prior_context.prior_scene_id if prior_context else 'none'}  "
+         f"extra_brief={'yes' if extra_brief else 'no'}")
+
     if isinstance(target, SubScene):
         parent_item = next(s for s in plan.scenes if s.id == parent_id)
         brief = build_worker_user_message(
@@ -459,7 +465,13 @@ def _drive_tool_loop(
     accepted_summary = ""
     last_done_error: Optional[str] = None
 
-    for _ in range(max_iter):
+    info(f"worker:{ctx.scene_id}",
+         f"tool loop starting — model={ctx.model}  max_iter={max_iter}  "
+         f"prior_context={'yes' if ctx.prior_context else 'no'}")
+
+    for iteration in range(1, max_iter + 1):
+        log(f"worker:{ctx.scene_id}", f"iter {iteration} → calling model…",
+            style="blue")
         response = client.models.generate_content(
             model=ctx.model,
             contents=contents,
@@ -473,15 +485,19 @@ def _drive_tool_loop(
             ),
         )
         if not response.candidates:
+            warn(f"worker:{ctx.scene_id}", f"iter {iteration} model returned no candidates")
             break
         candidate = response.candidates[0]
         if candidate.content is None or not candidate.content.parts:
+            warn(f"worker:{ctx.scene_id}", f"iter {iteration} model returned empty content")
             break
 
         contents.append(candidate.content)
 
         fc_parts = [p for p in candidate.content.parts if getattr(p, "function_call", None)]
         if not fc_parts:
+            warn(f"worker:{ctx.scene_id}",
+                 f"iter {iteration} model emitted text instead of function calls; nudging")
             contents.append(types.Content(
                 role="user",
                 parts=[types.Part.from_text(text=(
@@ -501,7 +517,9 @@ def _drive_tool_loop(
             except (TypeError, ValueError):
                 args = {}
 
+            log_tool_call(ctx.scene_id, iteration, name, args)
             tool_response = dispatch(name, args, ctx)
+            log_tool_response(ctx.scene_id, iteration, name, tool_response)
             response_parts.append(types.Part.from_function_response(
                 name=name, response=tool_response,
             ))
@@ -517,7 +535,13 @@ def _drive_tool_loop(
         contents.append(types.Content(role="user", parts=response_parts))
 
         if done_seen:
+            info(f"worker:{ctx.scene_id}",
+                 f"done() accepted at iter {iteration}; tool loop exiting")
             break
+    else:
+        warn(f"worker:{ctx.scene_id}",
+             f"tool loop hit max_iter={max_iter} without done(); "
+             f"will return best-effort or fail")
 
     return _finalize_tool_result(
         ctx, target, ident, file_stem, expected_class,
