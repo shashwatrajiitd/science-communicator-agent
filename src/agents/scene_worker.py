@@ -27,7 +27,7 @@ from src.agents.schemas import (
     SubScene,
 )
 from src.agents.tools import probe_video, render_manim_scene
-from src.gemini_agent import _strip_fences
+from src.gemini_agent import _strip_fences, normalize_tts_to_gemini
 
 load_dotenv()
 
@@ -69,23 +69,7 @@ def _ensure_scene_class(code: str, expected_class: str) -> str:
     return re.sub(rf"\b{re.escape(actual)}\b", expected_class, code)
 
 
-def _normalize_tts(code: str) -> str:
-    """Force the worker output to use GeminiTTSService, no matter what the
-    model wrote. The model occasionally falls back to the gTTS pattern from
-    the base system prompt; we rewrite those imports/calls deterministically."""
-    # Imports
-    code = re.sub(
-        r"from\s+manim_voiceover\.services\.gtts\s+import\s+GTTSService",
-        "from src.agents.tts import GeminiTTSService",
-        code,
-    )
-    # set_speech_service(GTTSService(...))
-    code = re.sub(
-        r"GTTSService\([^)]*\)",
-        'GeminiTTSService(voice="Aoede")',
-        code,
-    )
-    return code
+_normalize_tts = normalize_tts_to_gemini
 
 
 # ---------------------------------------------------------------------------

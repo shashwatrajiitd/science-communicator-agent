@@ -29,7 +29,7 @@ Output a SINGLE complete Python file that defines ONE Scene and nothing else.
 ```
 from manim import *
 from manim_voiceover import VoiceoverScene
-from manim_voiceover.services.gtts import GTTSService
+from src.agents.tts import GeminiTTSService
 import numpy as np
 ```
 
@@ -37,9 +37,15 @@ import numpy as np
 ```
 class <PascalCaseName>(VoiceoverScene):
     def construct(self):
-        self.set_speech_service(GTTSService(lang="en", tld="com"))
+        self.set_speech_service(GeminiTTSService(voice="Aoede"))
         # ... animations wrapped in `with self.voiceover(...)` blocks ...
 ```
+
+# VOICE — MANDATORY:
+Use ONLY `GeminiTTSService` (Gemini's native AI voice). Do NOT use gTTS,
+edge-tts, ElevenLabs, or any other speech service. The voice must be one of:
+Aoede (default warm/clear), Puck (lively), Charon (deep), Kore (warm-female),
+Fenrir (gravelly), Leda (youthful), Orus (formal-masculine), Zephyr (bright).
 
 # NARRATION RULES (most important):
 1. EVERY animation block must be inside a `with self.voiceover(text=...) as tracker:` block.
@@ -114,6 +120,37 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
+def normalize_tts_to_gemini(code: str) -> str:
+    """Rewrite any non-Gemini speech service to GeminiTTSService.
+
+    The TTS contract for this project is "always Gemini AI voice". If the
+    model regresses and emits gTTS / edge-tts / ElevenLabs imports, we rewrite
+    them deterministically here so the rendered scene still uses Gemini TTS.
+    """
+    # gTTS
+    code = re.sub(
+        r"from\s+manim_voiceover\.services\.gtts\s+import\s+GTTSService",
+        "from src.agents.tts import GeminiTTSService",
+        code,
+    )
+    code = re.sub(r"GTTSService\([^)]*\)", 'GeminiTTSService(voice="Aoede")', code)
+    # edge-tts
+    code = re.sub(
+        r"from\s+manim_voiceover\.services\.edge_tts\s+import\s+\w+",
+        "from src.agents.tts import GeminiTTSService",
+        code,
+    )
+    code = re.sub(r"EdgeTTSService\([^)]*\)", 'GeminiTTSService(voice="Aoede")', code)
+    # ElevenLabs
+    code = re.sub(
+        r"from\s+manim_voiceover\.services\.elevenlabs\s+import\s+\w+",
+        "from src.agents.tts import GeminiTTSService",
+        code,
+    )
+    code = re.sub(r"ElevenLabsService\([^)]*\)", 'GeminiTTSService(voice="Aoede")', code)
+    return code
+
+
 def _gen(client, model: str, contents, system: str) -> str:
     from google.genai import types
 
@@ -134,6 +171,7 @@ def generate_scene(topic: str, model: str = DEFAULT_MODEL) -> SceneScript:
 
     client = genai.Client(api_key=api_key)
     code = _gen(client, model, f"Topic: {topic}", SYSTEM_PROMPT)
+    code = normalize_tts_to_gemini(code)
     return SceneScript(code=code, scene_class=_extract_scene_class(code))
 
 
@@ -161,6 +199,7 @@ def repair_scene(broken_code: str, error_text: str,
         "Now output the corrected full file."
     )
     code = _gen(client, model, contents, repair_instruction)
+    code = normalize_tts_to_gemini(code)
     return SceneScript(code=code, scene_class=_extract_scene_class(code))
 
 

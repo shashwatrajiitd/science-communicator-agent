@@ -42,8 +42,12 @@ def _find_rendered_video(scene_class: str) -> Path | None:
 
 
 def _try_render(path: Path, scene_class: str, quality: str) -> tuple[bool, str]:
+    import os
     cmd = ["manim", f"-q{quality}", "--disable_caching", str(path), scene_class]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{ROOT}{os.pathsep}{existing}" if existing else str(ROOT)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=str(ROOT))
     return proc.returncode == 0, (proc.stdout + "\n" + proc.stderr)
 
 

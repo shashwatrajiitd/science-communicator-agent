@@ -16,7 +16,9 @@ opencv-python>=4.9.0          # Frame-level processing
 Pillow>=10.0.0
 
 # --- Voiceover (auto-syncs animation timing to TTS) ---
-manim-voiceover[gtts]>=0.3.7  # Built-in narration in Manim scenes
+manim-voiceover>=0.3.7        # Built-in narration in Manim scenes.
+                              # No [gtts] extra: this project uses GeminiTTSService
+                              # (src/agents/tts.py) — gTTS is never imported.
 # System dep: brew install sox (already installed)
 setuptools<81                 # pkg_resources still required by manim-voiceover
 
@@ -43,7 +45,8 @@ networkx>=3.2
 matplotlib>=3.8.0
 
 # --- Utilities ---
-python-dotenv>=1.0.0          # Load API keys from .env
+python-dotenv>=0.21.0,<0.22.0  # Pinned by manim-voiceover 0.3.7. Codebase
+                               # only uses load_dotenv(), which is stable.
 rich>=13.7.0                  # Pretty terminal output
 typer>=0.12.0                 # CLI interface
 pyyaml>=6.0
