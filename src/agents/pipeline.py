@@ -38,7 +38,9 @@ async def run(
     aspect_ratio: str = "16:9",
     parallel: bool = False,
     use_tool_worker: bool = True,
-    max_tool_iterations: int = 8,
+    max_tool_iterations: int = 12,
+    adviser_model: Optional[str] = None,
+    escalate_after_render_failures: int = 5,
     log: Optional[callable] = None,
     pre_plan_approval: Optional[callable] = None,
     post_scene_approval: Optional[callable] = None,
@@ -96,6 +98,8 @@ async def run(
                 resolution=resolution, aspect_ratio=aspect_ratio,
                 use_tool_worker=use_tool_worker,
                 max_tool_iterations=max_tool_iterations,
+                adviser_model=adviser_model,
+                escalate_after_render_failures=escalate_after_render_failures,
             )
             for item in plan.scenes
         ])
@@ -113,6 +117,8 @@ async def run(
                 prior_context=current_prior,
                 use_tool_worker=use_tool_worker,
                 max_tool_iterations=max_tool_iterations,
+                adviser_model=adviser_model,
+                escalate_after_render_failures=escalate_after_render_failures,
             )
             if post_scene_approval is not None:
                 async def _rerun(extra: Optional[str], _item=item,
@@ -126,6 +132,8 @@ async def run(
                         prior_context=_prior,
                         use_tool_worker=use_tool_worker,
                         max_tool_iterations=max_tool_iterations,
+                        adviser_model=adviser_model,
+                        escalate_after_render_failures=escalate_after_render_failures,
                         extra_brief=extra,
                     )
                 r = await _maybe_await(post_scene_approval(item, r, _rerun))
@@ -215,6 +223,8 @@ async def run(
                         resolution=resolution, aspect_ratio=aspect_ratio,
                         use_tool_worker=use_tool_worker,
                         max_tool_iterations=max_tool_iterations,
+                        adviser_model=adviser_model,
+                        escalate_after_render_failures=escalate_after_render_failures,
                     ))
                 patched: list[SceneResult] = await asyncio.gather(*patch_tasks)
                 patched_by_id = {r.id: r for r in patched}
@@ -238,6 +248,8 @@ async def run(
                             prior_context=prior_seq,
                             use_tool_worker=use_tool_worker,
                             max_tool_iterations=max_tool_iterations,
+                            adviser_model=adviser_model,
+                            escalate_after_render_failures=escalate_after_render_failures,
                         )
                         patched_by_id[scene.id] = r
                         live[scene.id] = r

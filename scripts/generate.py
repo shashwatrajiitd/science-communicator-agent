@@ -144,8 +144,23 @@ def main(
         ),
     ),
     max_tool_iterations: int = typer.Option(
-        8, "--max-tool-iterations",
+        12, "--max-tool-iterations",
         help="Hard ceiling on tool calls per scene for the tool-use worker.",
+    ),
+    adviser_model: str = typer.Option(
+        "gemini-3.1-pro-preview", "--adviser-model",
+        help=(
+            "Model to escalate to when the worker hits N consecutive "
+            "render_manim failures. Falls back to --model on 404 / not-enabled."
+        ),
+    ),
+    escalate_after_render_failures: int = typer.Option(
+        4, "--escalate-after-render-failures",
+        help=(
+            "Total render_manim calls (success or failure) before swapping to "
+            "--adviser-model. Catches both 'render keeps erroring' loops and "
+            "'render succeeds but model keeps re-rendering' loops."
+        ),
     ),
     plan_mode: bool = typer.Option(
         False, "--plan-mode/--no-plan-mode",
@@ -223,6 +238,8 @@ def main(
         parallel=parallel,
         use_tool_worker=use_tool_worker,
         max_tool_iterations=max_tool_iterations,
+        adviser_model=adviser_model or None,
+        escalate_after_render_failures=escalate_after_render_failures,
         pre_plan_approval=pre_plan_cb,
         post_scene_approval=post_scene_cb,
     ))

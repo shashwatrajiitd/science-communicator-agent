@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,10 +86,14 @@ class RenderResult:
     video_path: Optional[Path]
 
 
+RENDER_TIMEOUT_SECONDS = 300
+
+
 def render_manim_scene(scene_file: Path, scene_class: str, quality: str = "l",
                        extra_args: Optional[list[str]] = None,
                        project_root: Optional[Path] = None,
-                       resolution: Optional[tuple[int, int]] = None) -> RenderResult:
+                       resolution: Optional[tuple[int, int]] = None,
+                       timeout: float = RENDER_TIMEOUT_SECONDS) -> RenderResult:
     """Render one Manim Scene class to mp4. Returns the path on success.
 
     Caching is disabled so re-renders pick up code changes. The scene's
@@ -122,9 +127,32 @@ def render_manim_scene(scene_file: Path, scene_class: str, quality: str = "l",
 
     # cwd=project_root so the manim media/ dir lands in the project, not in
     # whatever directory the caller happened to be in.
-    proc = subprocess.run(cmd, capture_output=True, text=True,
-                          env=env, cwd=str(project_root))
-    log = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+    # timeout guards against manim hanging in interpreter shutdown (the
+    # manim-voiceover Gemini-TTS adapter has been observed leaving a
+    # non-daemon thread alive that blocks Py_FinalizeEx). Popen + communicate
+    # so we can SIGKILL the whole process group on timeout.
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=env, cwd=str(project_root), start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        log = (stdout or "") + ("\n" + stderr if stderr else "")
+        return RenderResult(
+            success=False,
+            log=log + f"\n[render_manim_scene] TIMEOUT after {timeout:.0f}s — child killed",
+            video_path=None,
+        )
+    log = (stdout or "") + ("\n" + stderr if stderr else "")
     if proc.returncode != 0:
         return RenderResult(success=False, log=log, video_path=None)
 

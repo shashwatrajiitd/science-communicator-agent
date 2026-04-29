@@ -131,6 +131,32 @@ def get_function_declarations():
             },
         ),
         types.FunctionDeclaration(
+            name="web_search",
+            description=(
+                "Search the web for current documentation, examples, or fixes "
+                "to library API errors (Manim, manim_voiceover, ffmpeg, etc.). "
+                "Use this when render_manim has failed twice in a row with the "
+                "same kind of error and you suspect an API mismatch — for "
+                "example AttributeError on a class you're not sure about, or "
+                "TypeError on a function signature. The returned text is "
+                "grounded in real Google search results. Keep queries short "
+                "and specific (e.g. 'manim ThreeDCamera move_camera example')."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Specific search query, 3-10 words. Include the "
+                            "library and the API/error you're stuck on."
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
+        types.FunctionDeclaration(
             name="done",
             description=(
                 "Declare the scene complete and stop the validation loop. "
@@ -172,7 +198,16 @@ class WorkerToolContext:
     quality: str
     resolution: Optional[tuple[int, int]]
     prior_context: Optional[PriorContext]
-    model: str
+    model: str                    # active model; may be swapped to adviser_model
+    base_model: Optional[str] = None  # original model (for revert on adviser 404)
+    adviser_model: Optional[str] = None  # escalation target
+    escalated: bool = False       # set once when adviser kicks in
+    # Total render_manim calls in this scene, regardless of outcome. The
+    # adviser escalates when this hits the threshold — that catches both
+    # "render keeps failing" loops AND "render succeeds but model rejects
+    # for continuity / cosmetic reasons" loops. Either way the worker is
+    # spinning without progress toward done().
+    total_render_calls: int = 0
     attempt_idx: int = 0          # incremented by render_manim
     last_render_path: Optional[Path] = None
     last_code: Optional[str] = None
@@ -194,6 +229,8 @@ def dispatch(name: str, args: dict, ctx: WorkerToolContext) -> dict:
             return _tool_probe_audio(args, ctx)
         if name == "compare_to_prior_frame":
             return _tool_compare(args, ctx)
+        if name == "web_search":
+            return _tool_web_search(args, ctx)
         if name == "done":
             return _tool_done(args, ctx)
         return {"error": f"unknown tool {name!r}"}
@@ -301,6 +338,53 @@ def _tool_compare(args: dict, ctx: WorkerToolContext) -> dict:
 
     summary = _vision_diff(prior_path, this_path, ctx.model)
     return {"diff_summary": summary}
+
+
+def _tool_web_search(args: dict, ctx: WorkerToolContext) -> dict:
+    """Run a Google-grounded Gemini call to fetch documentation snippets.
+
+    The Gemini API rejects mixing `google_search` with function-calling in a
+    single request. So we expose `web_search` as a regular function the
+    worker calls, and we dispatch it by making a separate Gemini call that
+    has google_search ENABLED (and no function declarations). The grounded
+    answer text is returned to the worker as a regular function_response.
+    """
+    from google import genai
+    from google.genai import types
+
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return {"error": "query is required and must be non-empty."}
+
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return {"error": "GOOGLE_API_KEY missing — web_search disabled."}
+
+    try:
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=ctx.model,
+            contents=(
+                "Search the web and answer concisely with a code example if "
+                "applicable. Cite the library version when relevant.\n\n"
+                f"Query: {query}"
+            ),
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.2,
+            ),
+        )
+        text = (resp.text or "").strip()
+    except Exception as exc:
+        return {"error": f"web_search failed: {type(exc).__name__}: {exc}"}
+
+    # Trim to keep the function_response payload bounded.
+    if len(text) > 4000:
+        text = text[:4000] + "…"
+    return {
+        "query": query,
+        "answer": text or "(no answer)",
+    }
 
 
 def _tool_done(args: dict, ctx: WorkerToolContext) -> dict:

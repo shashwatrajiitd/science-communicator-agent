@@ -332,6 +332,20 @@ def _slug_to_pascal(slug: str) -> str:
     return "".join(p.capitalize() for p in parts if p) or "GeneratedScene"
 
 
+def _looks_like_model_unavailable(exc: Exception) -> bool:
+    """True if the exception looks like 'model not found / not enabled'.
+
+    Used by the escalation logic to decide whether to fall back from the
+    adviser model to the base model. We match on common indicators in the
+    Gemini SDK error text.
+    """
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "not_found", "404", "model not found", "not supported",
+        "permission_denied", "403", "is not enabled",
+    ))
+
+
 def _force_scene_class_in_brief(brief: str, expected: str) -> str:
     return re.sub(r"This scene class name MUST be: \S+",
                   f"This scene class name MUST be: {expected}", brief)
@@ -361,10 +375,17 @@ async def render_scene_with_tools(
     extra_brief: Optional[str] = None,
     resolution: Optional[tuple[int, int]] = None,
     aspect_ratio: Optional[str] = None,
-    max_tool_iterations: int = 8,
+    max_tool_iterations: int = 12,
+    adviser_model: Optional[str] = None,
+    escalate_after_render_failures: int = 5,
 ) -> SceneResult:
     """Self-validating worker: hands tools to Gemini and lets it drive the
     render → inspect → fix loop until it calls done() or runs out of budget.
+
+    `adviser_model` (e.g. `gemini-3.1-pro-preview`) is invoked instead of
+    `model` after `escalate_after_render_failures` consecutive render_manim
+    failures. The full conversation (including every prior error log_tail)
+    is preserved across the swap.
     """
     project_root = Path(project_root)
     artifacts_root = project_root / "output" / run_id
@@ -418,12 +439,14 @@ async def render_scene_with_tools(
         resolution=resolution,
         prior_context=prior_context,
         model=model,
+        base_model=model,
+        adviser_model=adviser_model,
     )
 
     return await asyncio.to_thread(
         _drive_tool_loop,
         ctx, brief, target, ident, file_stem, expected_class,
-        max_tool_iterations,
+        max_tool_iterations, escalate_after_render_failures,
     )
 
 
@@ -435,6 +458,7 @@ def _drive_tool_loop(
     file_stem: str,
     expected_class: str,
     max_iter: int,
+    escalate_after_render_failures: int = 5,
 ) -> SceneResult:
     """Synchronous Gemini function-calling loop. Runs in a worker thread."""
     from google import genai
@@ -446,7 +470,7 @@ def _drive_tool_loop(
     client = genai.Client(api_key=api_key)
 
     declarations = get_function_declarations()
-    tool = types.Tool(function_declarations=declarations)
+    tools = [types.Tool(function_declarations=declarations)]
 
     user_parts = []
     pc = ctx.prior_context
@@ -470,20 +494,63 @@ def _drive_tool_loop(
          f"prior_context={'yes' if ctx.prior_context else 'no'}")
 
     for iteration in range(1, max_iter + 1):
-        log(f"worker:{ctx.scene_id}", f"iter {iteration} → calling model…",
-            style="blue")
-        response = client.models.generate_content(
-            model=ctx.model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=WORKER_SCENE_PROMPT_TOOL,
-                tools=[tool],
-                tool_config=types.ToolConfig(
-                    function_calling_config=types.FunctionCallingConfig(mode="ANY")
+        # Escalate to the adviser model after N total render_manim calls
+        # without a successful done(). Catches both failure loops and the
+        # "renders succeed but model keeps re-rendering" pattern.
+        if (not ctx.escalated
+                and ctx.adviser_model
+                and ctx.adviser_model != ctx.model
+                and ctx.total_render_calls >= escalate_after_render_failures):
+            log(f"worker:{ctx.scene_id}",
+                f"escalating: {ctx.total_render_calls} render_manim calls without done() "
+                f"→ switching model {ctx.model} → {ctx.adviser_model}",
+                style="bold yellow")
+            ctx.model = ctx.adviser_model
+            ctx.escalated = True
+
+        log(f"worker:{ctx.scene_id}",
+            f"iter {iteration} → calling model… ({ctx.model})", style="blue")
+        try:
+            response = client.models.generate_content(
+                model=ctx.model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=WORKER_SCENE_PROMPT_TOOL,
+                    tools=tools,
+                    tool_config=types.ToolConfig(
+                        function_calling_config=types.FunctionCallingConfig(mode="ANY")
+                    ),
+                    temperature=0.4,
                 ),
-                temperature=0.4,
-            ),
-        )
+            )
+        except Exception as exc:
+            # Adviser model not enabled on the API key (404 / NOT_FOUND), or
+            # any other transient API error on the escalated model — revert
+            # to the base model and retry this iteration.
+            if (ctx.escalated
+                    and ctx.base_model
+                    and ctx.model != ctx.base_model
+                    and _looks_like_model_unavailable(exc)):
+                warn(f"worker:{ctx.scene_id}",
+                     f"adviser model {ctx.model!r} unavailable ({exc!r}); "
+                     f"reverting to {ctx.base_model!r}")
+                ctx.model = ctx.base_model
+                # Don't reset escalated — we tried the adviser, it didn't
+                # work; stay on base for the rest of the scene.
+                response = client.models.generate_content(
+                    model=ctx.model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=WORKER_SCENE_PROMPT_TOOL,
+                        tools=tools,
+                        tool_config=types.ToolConfig(
+                            function_calling_config=types.FunctionCallingConfig(mode="ANY")
+                        ),
+                        temperature=0.4,
+                    ),
+                )
+            else:
+                raise
         if not response.candidates:
             warn(f"worker:{ctx.scene_id}", f"iter {iteration} model returned no candidates")
             break
@@ -523,6 +590,12 @@ def _drive_tool_loop(
             response_parts.append(types.Part.from_function_response(
                 name=name, response=tool_response,
             ))
+
+            # Count every render_manim call against the escalation budget.
+            # A render that succeeds but isn't followed by done() is just as
+            # symptomatic as one that fails — the model is stuck either way.
+            if name == "render_manim":
+                ctx.total_render_calls += 1
 
             if name == "done":
                 if tool_response.get("accepted"):
@@ -624,7 +697,7 @@ def _finalize_tool_result(
         extract_last_frame(stable_path, last_frame_path)
     except Exception:
         last_frame_path = None
-    return SceneResult(
+    final_result = SceneResult(
         id=ident, scene_class=expected_class, scene_file=scene_file,
         video_path=stable_path, duration_seconds=duration,
         attempts=ctx.attempt_idx, success=True,
@@ -632,3 +705,12 @@ def _finalize_tool_result(
         ending_state=accepted_summary,
         last_frame_path=last_frame_path,
     )
+    # Persist a sidecar so a later retry of a *parent* complex scene can skip
+    # re-rendering this sub-scene if it already succeeded. The cache is keyed
+    # by the same `scene_<ident>` filename the stitcher uses.
+    try:
+        sidecar = artifacts_root / f"scene_{ident}.result.json"
+        sidecar.write_text(json.dumps(final_result.to_dict(), indent=2))
+    except Exception:
+        pass
+    return final_result

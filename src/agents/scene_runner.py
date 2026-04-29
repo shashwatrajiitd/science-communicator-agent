@@ -11,7 +11,10 @@ import asyncio
 from pathlib import Path
 from typing import Optional
 
+import json
+
 from src.agents.judge import judge_scene
+from src.agents.log import info as _log_info
 from src.agents.scene_worker import render_scene, render_scene_with_tools
 from src.agents.schemas import (
     JudgeReport,
@@ -41,6 +44,8 @@ async def run_scene(
     prior_context: Optional[PriorContext] = None,
     use_tool_worker: bool = False,
     max_tool_iterations: int = 8,
+    adviser_model: Optional[str] = None,
+    escalate_after_render_failures: int = 5,
 ) -> SceneResult:
     if item.complexity == "simple" or not item.sub_scenes:
         async with sem:
@@ -53,6 +58,8 @@ async def run_scene(
                     resolution=resolution, aspect_ratio=aspect_ratio,
                     prior_context=prior_context,
                     max_tool_iterations=max_tool_iterations,
+                    adviser_model=adviser_model,
+                    escalate_after_render_failures=escalate_after_render_failures,
                 )
             else:
                 result = await render_scene(
@@ -75,6 +82,7 @@ async def run_scene(
             max_attempts, judge, n_frames, model, extra_brief,
             resolution, aspect_ratio,
             prior_context, use_tool_worker, max_tool_iterations,
+            adviser_model, escalate_after_render_failures,
         ))
         for sub in item.sub_scenes
     ]
@@ -158,7 +166,24 @@ async def _run_sub_with_sem(sub, parent_item, plan, run_id, quality,
                             project_root, sem, max_attempts, judge, n_frames,
                             model, extra_brief, resolution, aspect_ratio,
                             prior_context, use_tool_worker,
-                            max_tool_iterations) -> SceneResult:
+                            max_tool_iterations,
+                            adviser_model=None,
+                            escalate_after_render_failures=5) -> SceneResult:
+    sub_ident = f"{parent_item.id}__{sub.id}"
+
+    # Cache lookup: if this sub-scene already produced a clean render in a
+    # prior round of the parent, reuse it instead of paying to redo the work.
+    # Skipped when extra_brief is provided (operator's comment may apply
+    # globally; we don't know which sub-scene to keep) or in patch loops that
+    # forward QA hints.
+    if not extra_brief:
+        cached = _load_cached_result(Path(project_root), run_id, sub_ident)
+        if cached is not None:
+            _log_info(f"runner:{sub_ident}",
+                      f"reusing cached successful result "
+                      f"(duration={cached.duration_seconds}s, attempts={cached.attempts})")
+            return cached
+
     async with sem:
         if use_tool_worker:
             result = await render_scene_with_tools(
@@ -169,6 +194,8 @@ async def _run_sub_with_sem(sub, parent_item, plan, run_id, quality,
                 resolution=resolution, aspect_ratio=aspect_ratio,
                 prior_context=prior_context,
                 max_tool_iterations=max_tool_iterations,
+                adviser_model=adviser_model,
+                escalate_after_render_failures=escalate_after_render_failures,
             )
         else:
             result = await render_scene(
@@ -180,6 +207,41 @@ async def _run_sub_with_sem(sub, parent_item, plan, run_id, quality,
             )
         _ensure_last_frame(result, project_root, run_id)
         return result
+
+
+def _load_cached_result(project_root: Path, run_id: str, ident: str) -> Optional[SceneResult]:
+    """Read a sidecar JSON from a prior successful render of this scene/sub.
+
+    The sidecar is written by `scene_worker._finalize_tool_result`. We only
+    return a result when the sidecar is present, marks success, and the mp4
+    it points at still exists on disk — i.e. the artifacts haven't been
+    pruned out from under us.
+    """
+    sidecar = Path(project_root) / "output" / run_id / f"scene_{ident}.result.json"
+    if not sidecar.exists():
+        return None
+    try:
+        data = json.loads(sidecar.read_text())
+    except Exception:
+        return None
+    if not data.get("success"):
+        return None
+    video_path = Path(data["video_path"]) if data.get("video_path") else None
+    if video_path is None or not video_path.exists():
+        return None
+    return SceneResult(
+        id=data["id"],
+        scene_class=data["scene_class"],
+        scene_file=Path(data["scene_file"]) if data.get("scene_file") else None,
+        video_path=video_path,
+        duration_seconds=data.get("duration_seconds"),
+        attempts=data.get("attempts", 0),
+        success=True,
+        last_error=None,
+        last_judge=None,  # JudgeReport reconstruction skipped; not used downstream
+        ending_state=data.get("ending_state", ""),
+        last_frame_path=Path(data["last_frame_path"]) if data.get("last_frame_path") else None,
+    )
 
 
 def _ensure_last_frame(result: SceneResult, project_root: Path, run_id: str) -> None:

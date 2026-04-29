@@ -97,6 +97,9 @@ def _summarize_args(tool_name: str, args: dict) -> str:
         return f"video_path={_short(args.get('video_path'))}"
     if tool_name == "compare_to_prior_frame":
         return f"this_frame_path={_short(args.get('this_frame_path'))}"
+    if tool_name == "web_search":
+        q = str(args.get("query") or "")
+        return f"query={_truncate(q, 80)!r}"
     if tool_name == "done":
         s = str(args.get("ending_state_summary") or "")
         return f"video_path={_short(args.get('video_path'))}, summary={_truncate(s, 60)!r}"
@@ -119,6 +122,8 @@ def _summarize_response(tool_name: str, resp: dict) -> str:
         return f"has_audio={resp.get('has_audio')} duration={resp.get('duration_s')}s"
     if tool_name == "compare_to_prior_frame":
         return f"diff={_truncate(resp.get('diff_summary', ''), 160)!r}"
+    if tool_name == "web_search":
+        return f"answer={_truncate(resp.get('answer', ''), 160)!r}"
     if tool_name == "done":
         if resp.get("accepted"):
             return f"ACCEPTED duration={resp.get('duration_s')}s"
