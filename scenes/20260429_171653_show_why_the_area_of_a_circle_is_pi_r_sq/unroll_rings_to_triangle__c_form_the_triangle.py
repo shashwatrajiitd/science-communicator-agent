@@ -7,96 +7,97 @@ class UnrollRingsToTriangleCFormTheTriangle(VoiceoverScene):
     def construct(self):
         self.set_speech_service(GeminiTTSService(voice="Aoede"))
 
-        # Parameters from shared objects
-        r = 2.0
-        circ = 2 * np.pi * r
-        n_rings = 100
-        dr = r / n_rings
+        # --- CONFIGURATION ---
+        R = 2.0
+        C_LEN = 2 * PI * R
+        N_RINGS = 50
+        dr = R / N_RINGS
 
-        # Layout zones
-        center_zone = ORIGIN
-        caption_zone = DOWN * 2
+        # --- POSITIONING ---
+        # Center the final triangle shape on the screen.
+        # The triangle's bounding box is (C_LEN x R).
+        # We define the triangle's bottom-left origin such that its bounding box is centered at ORIGIN.
+        triangle_origin = -np.array([C_LEN / 2, R / 2, 0])
 
-        # Shared Object: the_circle
-        the_circle = Circle(radius=r, color=BLUE).move_to(center_zone + UP * 1.5)
-
-        # Create source rings inside the circle
+        # --- MOBJECT CREATION ---
+        # Create the initial rings, all starting at the center for the animation.
         rings = VGroup()
-        # Fix for issue #4: Rings are shades of BLUE
-        ring_colors = [interpolate_color(BLUE_E, BLUE_B, i / n_rings) for i in range(n_rings)]
-        for i in range(n_rings):
-            # Rings from outside in
-            outer_r = r * (n_rings - i) / n_rings
-            inner_r = r * (n_rings - i - 1) / n_rings
-            if inner_r < 0: inner_r = 0
+        # Iterate from outermost to innermost
+        for i in range(N_RINGS):
+            r_outer = R - i * dr
+            r_inner = R - (i + 1) * dr
             ring = Annulus(
-                inner_radius=inner_r,
-                outer_radius=outer_r,
+                inner_radius=r_inner,
+                outer_radius=r_outer,
+                color=BLUE,
                 fill_opacity=1,
-                stroke_width=0,
-                color=ring_colors[i]
-            ).move_to(the_circle.get_center())
+                stroke_width=0.5
+            ).move_to(ORIGIN)
             rings.add(ring)
 
-        # Create target rectangles that will form the triangle
+        # Create the final unrolled rectangles, positioned to form a right-angled triangle.
         rects = VGroup()
-        # Fix for issue #3: Rectangles are shades of GREEN
-        rect_colors = [interpolate_color(GREEN_E, GREEN_B, i / n_rings) for i in range(n_rings)]
-        for i in range(n_rings):
-            # Outermost ring (i=0) becomes the longest rectangle (the base)
-            rect_r = r * (n_rings - i - 0.5) / n_rings
-            rect_circ = 2 * np.pi * rect_r
+        for i in range(N_RINGS):
+            r_outer = R - i * dr
+            r_inner = R - (i + 1) * dr
+            avg_radius = (r_outer + r_inner) / 2
+            unrolled_len = 2 * PI * avg_radius
+            
             rect = Rectangle(
-                width=rect_circ,
                 height=dr,
+                width=unrolled_len,
+                color=BLUE,
                 fill_opacity=1,
-                stroke_width=0,
-                color=rect_colors[i]
+                stroke_width=0.5,
+                stroke_color=WHITE
             )
+            
+            # This is the key fix: align all rectangles by their bottom-left corner
+            # to form a vertical left edge. The i-th ring from the outside becomes
+            # the i-th rectangle from the bottom.
+            rect.move_to(triangle_origin + np.array([0, i * dr, 0]), aligned_edge=DL)
             rects.add(rect)
 
-        # Fix for issue #1: Arrange rectangles to form a perfect right-angled triangle
-        rects.arrange(DOWN, buff=0)
-        rects.align_to(rects[0], LEFT) # Align all left edges to the first (bottom) rect
-        rects.move_to(caption_zone)
-
-        # Shared Object: unrolled_triangle (outline)
-        v0 = rects.get_corner(DL) # Bottom-left
-        v1 = rects.get_corner(DR) # Bottom-right
-        v2 = rects.get_corner(UL) # Top-left
+        # --- SHARED OBJECTS (positioned for this scene) ---
         
-        # Shared Object: circumference_line
-        circumference_line = Line(v0, v1, color=YELLOW, stroke_width=6)
-        height_line = Line(v0, v2, color=GREEN, stroke_width=6)
-        hypotenuse = Line(v1, v2, color=GREEN, stroke_width=6)
-        unrolled_triangle = VGroup(circumference_line, height_line, hypotenuse)
-
-        circumference_label = MathTex(r"2\pi r", font_size=36, color=YELLOW)
-        circumference_label.next_to(circumference_line, DOWN, buff=0.2)
-
-        # Start scene with the circle and its component rings
-        self.add(the_circle, rings)
+        # unrolled_triangle spec: right-angled, vertices (0,0), (12.566, 0), (0, 2.0)
+        # We create it with vertices relative to the calculated triangle_origin.
+        verts_abs = [
+            triangle_origin,
+            triangle_origin + np.array([C_LEN, 0, 0]),
+            triangle_origin + np.array([0, R, 0])
+        ]
+        unrolled_triangle_outline = Polygon(*verts_abs, color=GREEN, stroke_width=6)
         
-        with self.voiceover(text="...what we end up with is a shape that looks remarkably like a triangle.") as tracker:
-            # Split the animation into two parts within the voiceover duration
-            transform_time = tracker.duration * 0.7
-            outline_time = tracker.duration * 0.3
+        # circumference_line spec: line from (0,0) to (12.566,0), color YELLOW, label "2πr"
+        circumference_line = Line(verts_abs[0], verts_abs[1], color=YELLOW, stroke_width=6)
+        circumference_label = MathTex(r"2\pi r", font_size=36, color=YELLOW).next_to(circumference_line, DOWN, buff=0.2)
+        
+        # The scene starts with the rings ready to be unrolled.
+        self.add(rings)
+        
+        # --- ANIMATION ---
+        narration_text = "...what we end up with is a shape that looks remarkably like a triangle."
+        with self.voiceover(text=narration_text) as tracker:
+            # The animation is deliberately longer than the short narration to give the viewer
+            # time to process the transformation.
+            unroll_duration = 5.0
+            outline_duration = 2.0
 
-            # The main animation: transform rings into the stacked rectangles
             self.play(
                 LaggedStart(
-                    *[
-                        Transform(rings[i], rects[i]) for i in range(n_rings)
-                    ],
-                    lag_ratio=0.05,
-                ),
-                FadeOut(the_circle),
-                run_time=transform_time
+                    *[Transform(rings[i], rects[i]) for i in range(N_RINGS)],
+                    lag_ratio=0.1,
+                    run_time=unroll_duration
+                )
+            )
+            
+            self.play(
+                Create(unrolled_triangle_outline),
+                Create(circumference_line),
+                Write(circumference_label),
+                run_time=outline_duration
             )
 
-            # Emphasize the final shape by drawing the triangle outline and label
-            self.play(
-                Create(unrolled_triangle),
-                Write(circumference_label),
-                run_time=outline_time
-            )
+        # Pause to let the viewer absorb the final result and meet the target duration.
+        self.wait(8)

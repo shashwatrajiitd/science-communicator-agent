@@ -12,16 +12,12 @@ class UnrollRingsToTriangleAUnrollOuterRing(VoiceoverScene):
         dr = 0.1 # Thickness of the ring
         circumference = 2 * PI * r
 
-        # Set camera to frame the unrolled rectangle and the future triangle.
-        # This is based on the unrolled_triangle spec, which has a base of length 2*pi*r
-        # and a height of r, with its bottom-left corner at the origin.
-        self.camera.frame.set(width=circumference + 2, height=6)
-        self.camera.frame.move_to(RIGHT * (circumference / 2) + UP * 1)
+        # Camera setup omitted — default frame is used.
 
         # --- Initial Objects ---
         # A circle from which the ring originates. Positioned at the top center of the view.
         # This matches the 'the_circle' shared object spec.
-        circle_pos = RIGHT * (circumference / 2) + UP * 3
+        circle_pos = RIGHT * (circumference / 2) + UP * 4
         the_circle = Circle(radius=r, color=BLUE).move_to(circle_pos)
 
         # The outermost ring, which we will unroll.
@@ -33,7 +29,10 @@ class UnrollRingsToTriangleAUnrollOuterRing(VoiceoverScene):
             stroke_width=0
         ).move_to(the_circle.get_center())
 
-        self.add(the_circle, outer_ring)
+        # Group for easy management
+        initial_group = VGroup(the_circle, outer_ring)
+        self.add(initial_group)
+        self.wait(0.5) # Brief pause to show the initial state
 
         # --- Beat 1: Unroll the ring ---
         with self.voiceover(text="When we unroll it, it becomes a long, thin strip. The length of this strip is just the circumference of that outer ring...") as tracker:

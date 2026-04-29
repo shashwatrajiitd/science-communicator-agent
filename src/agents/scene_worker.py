@@ -69,6 +69,25 @@ def _ensure_scene_class(code: str, expected_class: str) -> str:
     return re.sub(rf"\b{re.escape(actual)}\b", expected_class, code)
 
 
+def _normalize_tts(code: str) -> str:
+    """Force the worker output to use GeminiTTSService, no matter what the
+    model wrote. The model occasionally falls back to the gTTS pattern from
+    the base system prompt; we rewrite those imports/calls deterministically."""
+    # Imports
+    code = re.sub(
+        r"from\s+manim_voiceover\.services\.gtts\s+import\s+GTTSService",
+        "from src.agents.tts import GeminiTTSService",
+        code,
+    )
+    # set_speech_service(GTTSService(...))
+    code = re.sub(
+        r"GTTSService\([^)]*\)",
+        'GeminiTTSService(voice="Aoede")',
+        code,
+    )
+    return code
+
+
 # ---------------------------------------------------------------------------
 # Generation prompts
 # ---------------------------------------------------------------------------
@@ -194,6 +213,7 @@ async def render_scene(
             )
 
         code = _ensure_scene_class(code, expected_class)
+        code = _normalize_tts(code)
         scene_file.write_text(code)
         last_code = code
 

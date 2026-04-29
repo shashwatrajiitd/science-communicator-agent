@@ -2,7 +2,25 @@
 
 from __future__ import annotations
 
-from src.gemini_agent import SYSTEM_PROMPT as _BASE_WORKER_PROMPT
+from src.gemini_agent import SYSTEM_PROMPT as _RAW_BASE_WORKER_PROMPT
+
+
+# Strip the legacy gTTS instructions from the base prompt — the multi-agent
+# pipeline always uses GeminiTTSService. Without this, Gemini occasionally
+# follows the older example and writes gTTS code into a scene file.
+def _strip_gtts_from_base(text: str) -> str:
+    text = text.replace(
+        "from manim_voiceover.services.gtts import GTTSService",
+        "from src.agents.tts import GeminiTTSService",
+    )
+    text = text.replace(
+        'self.set_speech_service(GTTSService(lang="en", tld="com"))',
+        'self.set_speech_service(GeminiTTSService(voice="Aoede"))',
+    )
+    return text
+
+
+_BASE_WORKER_PROMPT = _strip_gtts_from_base(_RAW_BASE_WORKER_PROMPT)
 
 
 # ---------------------------------------------------------------------------
