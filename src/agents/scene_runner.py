@@ -88,6 +88,7 @@ async def run_scene(
                 n_frames=max(n_frames, 8),
                 model=model,
                 continuity_mode=True,
+                plan=plan,
             )
         except Exception as exc:
             continuity_report = JudgeReport(
@@ -96,7 +97,9 @@ async def run_scene(
                 issues=[],
             )
 
-    success = True if continuity_report is None else continuity_report.passed
+    # Best-effort success: even if the continuity judge flagged issues, we still
+    # have a valid concatenated mp4 the stitcher can use. Master QA + cross-scene
+    # continuity will see the issues via last_judge and feed them into the patch loop.
     return SceneResult(
         id=item.id,
         scene_class=item.scene_class,
@@ -104,8 +107,8 @@ async def run_scene(
         video_path=out_path,
         duration_seconds=total_duration,
         attempts=max(r.attempts for r in sub_results),
-        success=success,
-        last_error=None if success else "Continuity judge failed.",
+        success=True,
+        last_error=None,
         last_judge=continuity_report,
     )
 

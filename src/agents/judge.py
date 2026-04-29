@@ -46,11 +46,17 @@ async def judge_scene(
     n_frames: int = 8,
     model: str = "gemini-2.5-pro",
     continuity_mode: bool = False,
+    plan: Optional[object] = None,
+    parent_scene_id: Optional[str] = None,
 ) -> JudgeReport:
     """Run the visual + narration judge against `video_path`.
 
     `target` is the scene or sub-scene being judged. `continuity_mode=True` is
     used after concatenating sub-scenes to focus on narrative flow.
+
+    If `plan` is provided, the judge is told about any `shared_objects`
+    relevant to this scene (looked up via `parent_scene_id` for sub-scenes,
+    or `target.id` for top-level scenes).
     """
     video_path = Path(video_path)
     frames_dir = Path(frames_dir)
@@ -64,7 +70,12 @@ async def judge_scene(
             issues=[],
         )
 
-    user_msg = _build_user_text(target, info.duration, continuity_mode)
+    shared_for_scene = []
+    if plan is not None and hasattr(plan, "shared_objects_for_scene"):
+        scene_id = parent_scene_id or getattr(target, "id", "")
+        shared_for_scene = plan.shared_objects_for_scene(scene_id)
+
+    user_msg = _build_user_text(target, info.duration, continuity_mode, shared_for_scene)
 
     json_text = await asyncio.to_thread(
         _call_judge, model, user_msg, frames
@@ -82,7 +93,8 @@ async def judge_scene(
 
 
 def _build_user_text(target: PlanTarget, measured_duration: float,
-                     continuity_mode: bool) -> str:
+                     continuity_mode: bool,
+                     shared_objects: Optional[list] = None) -> str:
     target_seconds = target.target_seconds
     beats = target.beats or []
     beats_text = "\n".join(
@@ -91,6 +103,23 @@ def _build_user_text(target: PlanTarget, measured_duration: float,
     )
     checks = "\n".join(f"  - {c}" for c in (target.correctness_checks or []))
     visuals = "\n".join(f"  - {v}" for v in (target.key_visuals or []))
+
+    shared_block = ""
+    if shared_objects:
+        shared_lines = []
+        for o in shared_objects:
+            label = f' label="{o.label}"' if o.label else ""
+            shared_lines.append(
+                f"  - name: {o.name}\n"
+                f"    color: {o.color}{label}\n"
+                f"    spec: {o.spec}"
+            )
+        shared_block = (
+            "\n\nshared_objects (these MUST be drawn EXACTLY per spec for cross-scene\n"
+            "continuity. A mismatched shape/orientation is a HIGH severity\n"
+            "geometric_error even if the shape is correct in isolation):\n"
+            + "\n".join(shared_lines)
+        )
 
     mode_note = ""
     if continuity_mode:
@@ -113,11 +142,11 @@ correctness_checks (acceptance criteria):
 {checks or '  (none)'}
 
 planned narration beats (verbatim):
-{beats_text or '  (no narration)'}{mode_note}
+{beats_text or '  (no narration)'}{shared_block}{mode_note}
 
 The N frames below are sampled in chronological order. Inspect them against
-the description, the correctness_checks, and the narration. Decide whether
-the scene passes. Output a JudgeReport JSON object."""
+the description, the correctness_checks, the shared_objects, and the
+narration. Decide whether the scene passes. Output a JudgeReport JSON object."""
 
 
 def _call_judge(model: str, user_msg: str, frame_paths: list[Path]) -> str:

@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from src.agents.continuity import check_continuity
 from src.agents.master import deterministic_qa, plan_video, qa_review
 from src.agents.scene_runner import run_scene
 from src.agents.schemas import ScenePlan, SceneResult
@@ -88,12 +89,31 @@ async def run(
     if qa_enabled:
         for patch_pass in range(1, patch_passes + 2):  # 0 = initial check, 1..patch_passes = patches
             det_issues = deterministic_qa(plan, [r.to_dict() for r in results])
-            log(f"[pipeline] QA pass {patch_pass}: {len(det_issues)} deterministic issues")
-            qa_report = await qa_review(plan, [r.to_dict() for r in results], det_issues, model=model)
+
+            # Cross-scene continuity check (LLM vision on adjacent boundaries).
+            scene_videos = {
+                r.id: Path(r.video_path)
+                for r in results if r.success and r.video_path and Path(r.video_path).exists()
+            }
+            continuity_issues: list[dict] = []
+            if judge and len(scene_videos) >= 2 and plan.shared_objects:
+                log(f"[pipeline] running continuity check across {len(scene_videos)} scenes...")
+                try:
+                    continuity_issues = await check_continuity(
+                        plan, scene_videos,
+                        artifacts_dir=artifacts_dir, model=model,
+                    )
+                    log(f"[pipeline] continuity issues: {len(continuity_issues)}")
+                except Exception as exc:
+                    log(f"[pipeline] continuity check failed: {exc!r}")
+            all_det_issues = det_issues + continuity_issues
+            log(f"[pipeline] QA pass {patch_pass}: {len(det_issues)} det + {len(continuity_issues)} continuity")
+
+            qa_report = await qa_review(plan, [r.to_dict() for r in results], all_det_issues, model=model)
             (artifacts_dir / "qa.json").write_text(json.dumps(qa_report.to_dict(), indent=2))
 
             if qa_report.overall_ok and not [
-                d for d in det_issues if d["severity"] in ("medium", "high")
+                d for d in all_det_issues if d["severity"] in ("medium", "high")
             ]:
                 log(f"[pipeline] QA passed.")
                 break
@@ -101,18 +121,24 @@ async def run(
                 log(f"[pipeline] QA still has issues, but patch budget exhausted.")
                 break
 
-            # Patch failing scenes
-            affected = sorted({i.scene_id for i in qa_report.issues if i.scene_id != "global"})
-            affected = affected or [
-                d["scene_id"] for d in det_issues
-                if d["scene_id"] != "global" and d["severity"] in ("medium", "high")
-            ]
+            # Patch failing scenes — combine LLM QA hints + continuity hints
+            id_to_hints: dict[str, list[str]] = {}
+            for i in qa_report.issues:
+                if i.scene_id != "global":
+                    id_to_hints.setdefault(i.scene_id, []).append(i.fix_hint)
+            for d in continuity_issues:
+                if d["scene_id"] != "global":
+                    id_to_hints.setdefault(d["scene_id"], []).append(d["fix_hint"])
+            for d in det_issues:
+                if d["scene_id"] != "global" and d["severity"] in ("medium", "high"):
+                    id_to_hints.setdefault(d["scene_id"], []).append(d["fix_hint"])
+
+            affected = sorted(id_to_hints.keys())
             if not affected:
                 log(f"[pipeline] only global issues — nothing to patch.")
                 break
 
             log(f"[pipeline] patch pass {patch_pass}: re-rendering scenes {affected}")
-            id_to_hint = {i.scene_id: i.fix_hint for i in qa_report.issues}
             sem2 = asyncio.Semaphore(parallelism)
             id_to_item = {s.id: s for s in plan.scenes}
             patch_tasks = []
@@ -120,19 +146,20 @@ async def run(
                 item = id_to_item.get(sid)
                 if item is None:
                     continue
+                combined_hint = "\n".join(id_to_hints[sid])
                 patch_tasks.append(run_scene(
                     item, plan,
                     run_id=run_id, quality=quality, project_root=PROJECT_ROOT,
                     sem=sem2, max_attempts=max_attempts, judge=judge,
                     n_frames=n_frames, model=model,
-                    extra_brief=id_to_hint.get(sid, ""),
+                    extra_brief=combined_hint,
                 ))
             patched: list[SceneResult] = await asyncio.gather(*patch_tasks)
             patched_by_id = {r.id: r for r in patched}
             patch_log.append({
                 "pass": patch_pass,
                 "affected": affected,
-                "hints": id_to_hint,
+                "hints": id_to_hints,
                 "outcomes": {pid: r.success for pid, r in patched_by_id.items()},
             })
             # Replace results for affected scenes

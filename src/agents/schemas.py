@@ -83,12 +83,34 @@ class ScenePlanItem:
 
 
 @dataclass
+class SharedObject:
+    """A visual element that appears in multiple scenes and must be drawn
+    identically (same geometry, colors, labels, orientation) in each one."""
+    name: str               # e.g. "unrolled_triangle", "the_circle", "gaussian_curve"
+    spec: str               # geometric/visual specification, prose + numbers
+    color: str              # named Manim color, e.g. "BLUE"
+    label: str              # what label appears next to it, "" for none
+    appears_in: list[str]   # scene ids where this object appears, e.g. ["03", "04"]
+
+    @staticmethod
+    def from_dict(d: dict) -> "SharedObject":
+        return SharedObject(
+            name=d["name"],
+            spec=d.get("spec", ""),
+            color=d.get("color", "WHITE"),
+            label=d.get("label", ""),
+            appears_in=list(d.get("appears_in", [])),
+        )
+
+
+@dataclass
 class ScenePlan:
     topic: str
     title: str
     total_target_seconds: float
     voice: str
     scenes: list[ScenePlanItem]
+    shared_objects: list[SharedObject] = field(default_factory=list)
 
     @staticmethod
     def from_dict(d: dict) -> "ScenePlan":
@@ -98,10 +120,14 @@ class ScenePlan:
             total_target_seconds=float(d["total_target_seconds"]),
             voice=d.get("voice", "Aoede"),
             scenes=[ScenePlanItem.from_dict(s) for s in d["scenes"]],
+            shared_objects=[SharedObject.from_dict(o) for o in d.get("shared_objects", [])],
         )
 
     def to_dict(self) -> dict:
         return _to_serializable(asdict(self))
+
+    def shared_objects_for_scene(self, scene_id: str) -> list["SharedObject"]:
+        return [o for o in self.shared_objects if scene_id in o.appears_in]
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +295,18 @@ _SCENE_ITEM_SCHEMA = {
     "required": ["id", "slug", "description", "target_seconds", "complexity"],
 }
 
+_SHARED_OBJECT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "spec": {"type": "string"},
+        "color": {"type": "string"},
+        "label": {"type": "string"},
+        "appears_in": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["name", "spec", "color", "appears_in"],
+}
+
 SCENE_PLAN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -277,6 +315,7 @@ SCENE_PLAN_SCHEMA = {
         "total_target_seconds": {"type": "number"},
         "voice": {"type": "string"},
         "scenes": {"type": "array", "items": _SCENE_ITEM_SCHEMA},
+        "shared_objects": {"type": "array", "items": _SHARED_OBJECT_SCHEMA},
     },
     "required": ["topic", "title", "total_target_seconds", "voice", "scenes"],
 }

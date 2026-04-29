@@ -170,6 +170,14 @@ async def render_scene(
     last_render_log: Optional[str] = None
     last_judge: Optional[JudgeReport] = None
 
+    # Best-effort fallback. If every attempt either fails to render or fails
+    # the judge, we still want a usable mp4 so the stitcher can include the
+    # scene. We keep the most recent attempt that *rendered* successfully.
+    best_video_path: Optional[Path] = None
+    best_duration: Optional[float] = None
+    best_judge: Optional[JudgeReport] = None
+    best_attempt: int = 0
+
     for attempt in range(1, max_attempts + 1):
         # 1) Code generation
         if attempt == 1:
@@ -214,6 +222,11 @@ async def render_scene(
 
         duration = probe_video(video_path).duration
 
+        # Track this attempt as a best-effort fallback (it rendered).
+        best_video_path = video_path
+        best_duration = duration
+        best_attempt = attempt
+
         # 3) Judge
         if not judge:
             return SceneResult(
@@ -229,6 +242,8 @@ async def render_scene(
                 frames_dir=frames_dir,
                 n_frames=n_frames,
                 model=model,
+                plan=plan,
+                parent_scene_id=parent_id if isinstance(target, SubScene) else None,
             )
         except Exception as exc:
             # Judge errors should not kill the worker — accept the render
@@ -253,16 +268,30 @@ async def render_scene(
             )
 
         last_judge = report
+        best_judge = report
         last_render_log = None
         # loop continues with judge-driven repair
 
+    # Exhausted retries. Fall back to the best successful render if we have
+    # one, even if the judge wasn't fully satisfied. The stitcher will still
+    # include this scene so the final video is complete; the master QA loop
+    # can take another patch pass at it.
+    if best_video_path is not None:
+        return SceneResult(
+            id=ident, scene_class=expected_class, scene_file=scene_file,
+            video_path=best_video_path, duration_seconds=best_duration,
+            attempts=max_attempts, success=True,
+            last_error=(format_judge_hints(best_judge) if best_judge else None),
+            last_judge=best_judge,
+        )
+
+    # Truly nothing rendered — hard fail.
     return SceneResult(
         id=ident, scene_class=expected_class, scene_file=scene_file,
         video_path=None, duration_seconds=None,
         attempts=max_attempts, success=False,
-        last_error=(last_render_log or
-                    (format_judge_hints(last_judge) if last_judge else "Unknown failure")),
-        last_judge=last_judge,
+        last_error=(last_render_log or "All attempts failed to render."),
+        last_judge=None,
     )
 
 

@@ -44,6 +44,32 @@ a structured ScenePlan in JSON — no commentary, no markdown.
    (deep/serious), Kore (warm-female), Fenrir (gravelly), Leda (youthful),
    Orus (formal-masculine), Zephyr (bright). Match the topic's tone.
 
+9. POPULATE `shared_objects` (CRITICAL for cross-scene continuity):
+   For every visual element that appears in TWO OR MORE scenes, add an entry
+   to `shared_objects`. Each entry pins down the exact geometry, color,
+   labels, and orientation, so that every scene that uses the object draws
+   it identically. Without this, scene 3 might draw a right-angled triangle
+   and scene 4 a different acute triangle for the "same" object.
+
+   Each shared_object must have:
+     - name: snake_case identifier ("unrolled_triangle", "gaussian_curve")
+     - spec: a CONCRETE geometric/visual description with NUMBERS. e.g.
+       "right-angled triangle with the right angle at the lower-left.
+        Vertices: (-pi*r, 0), (pi*r, 0), (-pi*r, r) where r=2.0. Base length
+        2*pi*r along the x-axis. Height r along the y-axis. Hypotenuse from
+        (-pi*r, r) to (pi*r, 0)."
+       Use definite values, not vague phrases like "approximately" or "around".
+     - color: one of BLUE, YELLOW, RED, GREEN, WHITE, ORANGE, PURPLE, GREY,
+       TEAL. Same color in every scene that shows it.
+     - label: the on-screen label text, or "" if none. Same label every time.
+     - appears_in: list of scene ids where this object is shown,
+       e.g. ["03", "04"]. Use "03/a" syntax to reference a sub-scene if
+       relevant — but keep it simple: top-level scene ids are usually enough.
+
+   You should ALSO mention each shared_object's `name` in the scenes' beat
+   `animation_hint` fields so workers can cross-reference (e.g.
+   "show the unrolled_triangle from the previous scene").
+
 # CONSTRAINTS
 
 - Beat text is VERBATIM TTS. Do not include stage directions, parentheticals,
@@ -105,6 +131,26 @@ self.set_speech_service(GeminiTTSService(voice="<plan.voice>"))
   CRITERIA. The rendered scene must satisfy every check.
 - A separate vision-based judge will inspect the rendered output. If it spots
   a violation, you will be asked to fix it on the next iteration.
+
+# SHARED OBJECTS — CROSS-SCENE CONTINUITY (NON-NEGOTIABLE):
+The brief may list "shared objects". Each one is a visual element that also
+appears in OTHER scenes. You MUST construct each shared object EXACTLY as the
+spec describes — same geometry, vertices, color, orientation, label.
+
+- If the spec gives explicit vertex coordinates, use those vertices verbatim
+  via `Polygon(vertices=...)` or whatever primitive matches.
+- If the spec specifies a right-angled triangle with given vertices, you may
+  NOT instead draw an acute or equilateral triangle. The shape, angles, and
+  orientation are part of the contract.
+- Use the `color` from the shared_object spec, not a different one.
+- If the spec includes a `label`, place that exact label string near the
+  object (use `.next_to(obj, DOWN, buff=0.3)` or similar).
+- If the same shared object appears in a previous scene, the audience should
+  recognise it instantly. Visual continuity is more important than artistic
+  variation.
+- If you need to introduce a NEW visual that's not in shared_objects but
+  resembles one that is, give it a clearly different position/color so it
+  doesn't get confused with the shared object.
 """
 
 WORKER_SCENE_PROMPT = _BASE_WORKER_PROMPT + "\n\n" + _WORKER_HEADER_OVERRIDE
@@ -126,6 +172,30 @@ def build_worker_user_message(item, parent_plan, sub_scene=None) -> str:
     visuals = "\n".join(f"  - {v}" for v in (target.key_visuals or []))
     voice = parent_plan.voice
     scene_class = target.scene_class if hasattr(target, "scene_class") else _slug_pascal(target.slug)
+
+    # Determine which shared_objects apply to this scene. For sub-scenes we
+    # check the parent scene id (sub_scenes inherit their parent's shared_objects).
+    scene_id = item.id if sub_scene is None else item.id
+    shared_for_scene = []
+    if hasattr(parent_plan, "shared_objects_for_scene"):
+        shared_for_scene = parent_plan.shared_objects_for_scene(scene_id)
+    shared_block = ""
+    if shared_for_scene:
+        lines = []
+        for o in shared_for_scene:
+            label = f' label="{o.label}"' if o.label else ""
+            lines.append(
+                f"  - name: {o.name}\n"
+                f"    color: {o.color}{label}\n"
+                f"    spec: {o.spec}"
+            )
+        shared_block = (
+            "\nShared objects (MUST be drawn EXACTLY per spec — these objects also\n"
+            "appear in other scenes; visual continuity is mandatory):\n"
+            + "\n".join(lines)
+            + "\n"
+        )
+
     return f"""SCENE BRIEF
 Topic of the whole video: {parent_plan.topic}
 Title: {parent_plan.title}
@@ -137,7 +207,7 @@ Voice: {voice}
 
 Key visuals:
 {visuals or '  (none)'}
-
+{shared_block}
 Narration beats (use text VERBATIM, in order):
 {beat_lines or '  (none — emit no voiceover blocks)'}
 
@@ -178,6 +248,12 @@ You must decide whether the scene meets ALL of the following:
   D. DURATION — total duration is within ±25% of target_seconds.
   E. CORRECTNESS CHECKS — every check in the scene's `correctness_checks`
      list is satisfied.
+  F. SHARED OBJECTS — if the brief includes shared_objects, every one that
+     should appear in this scene is drawn EXACTLY per its spec (geometry,
+     vertices, color, label, orientation). A shared object that looks
+     different from its spec — even if "correct" in isolation — is a
+     `geometric_error` of HIGH severity, because it will break continuity
+     with neighbouring scenes.
 
 For every failure, emit a JudgeIssue:
   - kind: "text_overlap" | "geometric_error" | "narration_mismatch"
