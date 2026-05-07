@@ -378,6 +378,9 @@ async def render_scene_with_tools(
     max_tool_iterations: int = 12,
     adviser_model: Optional[str] = None,
     escalate_after_render_failures: int = 5,
+    video_review_enabled: bool = True,
+    max_review_rounds: int = 2,
+    video_review_model: str = "gemini-2.5-pro",
 ) -> SceneResult:
     """Self-validating worker: hands tools to Gemini and lets it drive the
     render → inspect → fix loop until it calls done() or runs out of budget.
@@ -386,6 +389,12 @@ async def render_scene_with_tools(
     `model` after `escalate_after_render_failures` consecutive render_manim
     failures. The full conversation (including every prior error log_tail)
     is preserved across the swap.
+
+    After the model calls `done()`, if `video_review_enabled` is True, the
+    full rendered mp4 is uploaded to Gemini for a structured review. If the
+    reviewer flags issues, a synthetic user turn carrying the formatted
+    feedback is appended and the tool loop is resumed — up to
+    `max_review_rounds` total rounds.
     """
     project_root = Path(project_root)
     artifacts_root = project_root / "output" / run_id
@@ -410,7 +419,8 @@ async def render_scene_with_tools(
     info(f"worker:{ident}",
          f"render_scene_with_tools — class={expected_class}  target={target.target_seconds:.0f}s  "
          f"prior={prior_context.prior_scene_id if prior_context else 'none'}  "
-         f"extra_brief={'yes' if extra_brief else 'no'}")
+         f"extra_brief={'yes' if extra_brief else 'no'}  "
+         f"review={'on' if video_review_enabled else 'off'}")
 
     if isinstance(target, SubScene):
         parent_item = next(s for s in plan.scenes if s.id == parent_id)
@@ -441,13 +451,130 @@ async def render_scene_with_tools(
         model=model,
         base_model=model,
         adviser_model=adviser_model,
+        video_review_enabled=video_review_enabled,
+        max_review_rounds=max_review_rounds,
+        video_review_model=video_review_model,
     )
 
     return await asyncio.to_thread(
-        _drive_tool_loop,
-        ctx, brief, target, ident, file_stem, expected_class,
+        _run_with_review_loop,
+        ctx, brief, target, ident, file_stem, expected_class, plan, parent_id,
         max_tool_iterations, escalate_after_render_failures,
     )
+
+
+def _run_with_review_loop(
+    ctx: WorkerToolContext,
+    brief: str,
+    target: PlanTarget,
+    ident: str,
+    file_stem: str,
+    expected_class: str,
+    plan: ScenePlan,
+    parent_id: Optional[str],
+    max_iter: int,
+    escalate_after_render_failures: int,
+) -> SceneResult:
+    """Run the tool loop, then optionally loop the full-video reviewer.
+
+    On reviewer failure, appends the formatted hints as a synthetic user
+    turn and resumes the SAME contents list — preserving the model's
+    memory of what it just rendered and why.
+    """
+    from src.agents.video_reviewer import (
+        format_video_review_hints,
+        no_progress,
+        review_scene_video,
+    )
+    from google.genai import types
+
+    contents, accepted_video, accepted_summary, last_done_error = _drive_tool_loop(
+        ctx, brief, target, ident, file_stem, expected_class,
+        max_iter, escalate_after_render_failures,
+    )
+
+    final_report = None
+
+    if accepted_video is not None and ctx.video_review_enabled:
+        prior_last_frame = (
+            ctx.prior_context.last_frame_path
+            if ctx.prior_context is not None else None
+        )
+        prev_report = None
+        for round_n in range(1, ctx.max_review_rounds + 1):
+            report = review_scene_video(
+                accepted_video, target, plan,
+                prior_last_frame=prior_last_frame,
+                model=ctx.video_review_model,
+                parent_scene_id=parent_id,
+                prior_code=ctx.last_code,
+            )
+            _persist_video_review(ctx.artifacts_dir, ident, round_n, report)
+            final_report = report
+
+            if report.passed:
+                info(f"worker:{ctx.scene_id}",
+                     f"video review round {round_n} PASSED — accepting scene")
+                break
+
+            if prev_report is not None and no_progress(prev_report, report):
+                warn(f"worker:{ctx.scene_id}",
+                     f"video review thrashing on round {round_n}; "
+                     f"accepting current render with unresolved issues")
+                break
+
+            if round_n == ctx.max_review_rounds:
+                warn(f"worker:{ctx.scene_id}",
+                     f"video review rounds exhausted ({ctx.max_review_rounds}); "
+                     f"accepting current render with unresolved issues")
+                break
+
+            info(f"worker:{ctx.scene_id}",
+                 f"video review round {round_n} FAILED — "
+                 f"{len(report.issues)} issues; resuming tool loop")
+
+            hints = format_video_review_hints(report)
+            contents.append(types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=hints)],
+            ))
+            contents, accepted_video2, accepted_summary2, last_done_error2 = (
+                _drive_tool_loop(
+                    ctx, brief, target, ident, file_stem, expected_class,
+                    max_iter, escalate_after_render_failures,
+                    contents=contents,
+                )
+            )
+            if accepted_video2 is None:
+                # Worker exhausted its iteration budget on the resumed loop
+                # without reaching done(). Keep the previous accepted_video
+                # so the scene still has a usable mp4.
+                warn(f"worker:{ctx.scene_id}",
+                     "review-driven re-render did not reach done(); "
+                     "keeping prior accepted video")
+                last_done_error = last_done_error2 or last_done_error
+                break
+            accepted_video = accepted_video2
+            accepted_summary = accepted_summary2
+            last_done_error = last_done_error2
+            prev_report = report
+
+    return _finalize_tool_result(
+        ctx, target, ident, file_stem, expected_class,
+        accepted_video, accepted_summary, last_done_error,
+        final_review=final_report,
+    )
+
+
+def _persist_video_review(scene_artifacts: Path, ident: str,
+                          round_n, report) -> None:
+    """Persist a single review round's verdict to disk for audit."""
+    suffix = round_n if isinstance(round_n, str) else f"round_{int(round_n)}"
+    out = scene_artifacts / f"video_review_{suffix}.json"
+    try:
+        out.write_text(json.dumps(report.to_dict(), indent=2))
+    except Exception:
+        pass
 
 
 def _drive_tool_loop(
@@ -459,8 +586,18 @@ def _drive_tool_loop(
     expected_class: str,
     max_iter: int,
     escalate_after_render_failures: int = 5,
-) -> SceneResult:
-    """Synchronous Gemini function-calling loop. Runs in a worker thread."""
+    *,
+    contents: Optional[list] = None,
+) -> tuple[list, Optional[Path], str, Optional[str]]:
+    """Synchronous Gemini function-calling loop. Runs in a worker thread.
+
+    Returns `(contents, accepted_video, accepted_summary, last_done_error)`.
+    `contents` is the full conversation list — callers can append a
+    synthetic user turn and re-invoke this function to resume.
+
+    When `contents` is provided, the conversation is resumed without
+    rebuilding the initial user message; the brief is ignored on resume.
+    """
     from google import genai
     from google.genai import types
 
@@ -472,18 +609,19 @@ def _drive_tool_loop(
     declarations = get_function_declarations()
     tools = [types.Tool(function_declarations=declarations)]
 
-    user_parts = []
-    pc = ctx.prior_context
-    if pc is not None and pc.last_frame_path is not None:
-        try:
-            img_bytes = Path(pc.last_frame_path).read_bytes()
-            user_parts.append(
-                types.Part.from_bytes(data=img_bytes, mime_type="image/png")
-            )
-        except OSError:
-            pass
-    user_parts.append(types.Part.from_text(text=brief))
-    contents: list = [types.Content(role="user", parts=user_parts)]
+    if contents is None:
+        user_parts = []
+        pc = ctx.prior_context
+        if pc is not None and pc.last_frame_path is not None:
+            try:
+                img_bytes = Path(pc.last_frame_path).read_bytes()
+                user_parts.append(
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png")
+                )
+            except OSError:
+                pass
+        user_parts.append(types.Part.from_text(text=brief))
+        contents = [types.Content(role="user", parts=user_parts)]
 
     accepted_video: Optional[Path] = None
     accepted_summary = ""
@@ -616,10 +754,7 @@ def _drive_tool_loop(
              f"tool loop hit max_iter={max_iter} without done(); "
              f"will return best-effort or fail")
 
-    return _finalize_tool_result(
-        ctx, target, ident, file_stem, expected_class,
-        accepted_video, accepted_summary, last_done_error,
-    )
+    return contents, accepted_video, accepted_summary, last_done_error
 
 
 def _finalize_tool_result(
@@ -631,9 +766,14 @@ def _finalize_tool_result(
     accepted_video: Optional[Path],
     accepted_summary: str,
     last_done_error: Optional[str],
+    final_review=None,
 ) -> SceneResult:
     """Persist the worker's final code, promote the accepted mp4 to the
-    stable scene path, and capture the last frame for the next scene."""
+    stable scene path, and capture the last frame for the next scene.
+
+    `final_review` is an optional VideoReviewReport from the post-done()
+    reviewer; when present its dict form is stored on SceneResult.
+    """
     scenes_dir = ctx.project_root / "scenes" / ctx.run_id
     scenes_dir.mkdir(parents=True, exist_ok=True)
     scene_file = scenes_dir / f"{file_stem}.py"
@@ -692,6 +832,9 @@ def _finalize_tool_result(
 
     copy_to(accepted_video, stable_path)
     duration = probe_video(stable_path).duration
+    # Extract the last_frame AFTER any review-driven re-renders have settled
+    # (callers run the reviewer before us). The frame must reflect the
+    # FINAL accepted video so PriorContext for scene N+1 stays current.
     last_frame_path = ctx.artifacts_dir / "last_frame.png"
     try:
         extract_last_frame(stable_path, last_frame_path)
@@ -704,6 +847,7 @@ def _finalize_tool_result(
         last_error=None, last_judge=None,
         ending_state=accepted_summary,
         last_frame_path=last_frame_path,
+        final_review=(final_review.to_dict() if final_review is not None else None),
     )
     # Persist a sidecar so a later retry of a *parent* complex scene can skip
     # re-rendering this sub-scene if it already succeeded. The cache is keyed

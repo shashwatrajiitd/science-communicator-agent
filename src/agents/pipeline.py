@@ -41,6 +41,9 @@ async def run(
     max_tool_iterations: int = 12,
     adviser_model: Optional[str] = None,
     escalate_after_render_failures: int = 5,
+    video_review_enabled: bool = True,
+    max_review_rounds: int = 2,
+    video_review_model: str = "gemini-2.5-pro",
     log: Optional[callable] = None,
     pre_plan_approval: Optional[callable] = None,
     post_scene_approval: Optional[callable] = None,
@@ -100,6 +103,9 @@ async def run(
                 max_tool_iterations=max_tool_iterations,
                 adviser_model=adviser_model,
                 escalate_after_render_failures=escalate_after_render_failures,
+                video_review_enabled=video_review_enabled,
+                max_review_rounds=max_review_rounds,
+                video_review_model=video_review_model,
             )
             for item in plan.scenes
         ])
@@ -119,6 +125,9 @@ async def run(
                 max_tool_iterations=max_tool_iterations,
                 adviser_model=adviser_model,
                 escalate_after_render_failures=escalate_after_render_failures,
+                video_review_enabled=video_review_enabled,
+                max_review_rounds=max_review_rounds,
+                video_review_model=video_review_model,
             )
             if post_scene_approval is not None:
                 async def _rerun(extra: Optional[str], _item=item,
@@ -135,8 +144,24 @@ async def run(
                         adviser_model=adviser_model,
                         escalate_after_render_failures=escalate_after_render_failures,
                         extra_brief=extra,
+                        video_review_enabled=video_review_enabled,
+                        max_review_rounds=max_review_rounds,
+                        video_review_model=video_review_model,
                     )
-                r = await _maybe_await(post_scene_approval(item, r, _rerun))
+
+                async def _translate_comment(_item, _result, _comment,
+                                             _prior=current_prior) -> Optional[str]:
+                    return await _translate_planmode_comment(
+                        _item, _result, _comment,
+                        plan=plan, prior_context=_prior,
+                        artifacts_dir=artifacts_dir,
+                        video_review_model=video_review_model,
+                    )
+
+                r = await _maybe_await(post_scene_approval(
+                    item, r, _rerun,
+                    _translate_comment if video_review_enabled else None,
+                ))
             results.append(r)
             if r.success:
                 prior = _build_prior_context(item, r)
@@ -225,6 +250,12 @@ async def run(
                         max_tool_iterations=max_tool_iterations,
                         adviser_model=adviser_model,
                         escalate_after_render_failures=escalate_after_render_failures,
+                        # Master QA already provided structured patch hints;
+                        # running the per-scene reviewer on top would duplicate
+                        # work and burn tokens. Single source of feedback.
+                        video_review_enabled=False,
+                        max_review_rounds=max_review_rounds,
+                        video_review_model=video_review_model,
                     ))
                 patched: list[SceneResult] = await asyncio.gather(*patch_tasks)
                 patched_by_id = {r.id: r for r in patched}
@@ -250,6 +281,9 @@ async def run(
                             max_tool_iterations=max_tool_iterations,
                             adviser_model=adviser_model,
                             escalate_after_render_failures=escalate_after_render_failures,
+                            video_review_enabled=False,
+                            max_review_rounds=max_review_rounds,
+                            video_review_model=video_review_model,
                         )
                         patched_by_id[scene.id] = r
                         live[scene.id] = r
@@ -311,3 +345,68 @@ async def _maybe_await(value):
     if asyncio.iscoroutine(value) or asyncio.isfuture(value):
         return await value
     return value
+
+
+_PLANMODE_COMMENT_ROUND: dict[str, int] = {}
+
+
+async def _translate_planmode_comment(
+    item, result: SceneResult, comment: str,
+    *, plan: ScenePlan, prior_context: Optional[PriorContext],
+    artifacts_dir: Path, video_review_model: str,
+) -> Optional[str]:
+    """Send the rendered scene + operator comment to the video reviewer
+    and return formatted prose hints. None on failure (caller falls back
+    to passing the raw comment).
+
+    Persists `video_review_planmode_<n>.json` next to the scene's other
+    artifacts so the operator can audit what the reviewer said.
+    """
+    from src.agents.video_reviewer import (
+        format_video_review_hints,
+        review_scene_video,
+    )
+
+    if not result.video_path or not Path(result.video_path).exists():
+        return None
+
+    prior_last_frame = (
+        prior_context.last_frame_path
+        if prior_context is not None else None
+    )
+    prior_code = None
+    if result.scene_file and Path(result.scene_file).exists():
+        try:
+            prior_code = Path(result.scene_file).read_text()
+        except OSError:
+            prior_code = None
+
+    try:
+        report = await asyncio.to_thread(
+            review_scene_video,
+            Path(result.video_path), item, plan,
+            prior_last_frame=prior_last_frame,
+            user_comment=comment,
+            prior_code=prior_code,
+            model=video_review_model,
+            parent_scene_id=None,
+        )
+    except Exception:
+        return None
+
+    # Persist for audit. Round numbers are scene-scoped.
+    _PLANMODE_COMMENT_ROUND[item.id] = _PLANMODE_COMMENT_ROUND.get(item.id, 0) + 1
+    round_n = _PLANMODE_COMMENT_ROUND[item.id]
+    out = artifacts_dir / item.id / f"video_review_planmode_{round_n}.json"
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "operator_comment": comment,
+            "round": round_n,
+            "report": report.to_dict(),
+        }
+        out.write_text(json.dumps(payload, indent=2))
+    except Exception:
+        pass
+
+    return format_video_review_hints(report)

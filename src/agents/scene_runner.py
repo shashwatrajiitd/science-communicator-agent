@@ -46,6 +46,9 @@ async def run_scene(
     max_tool_iterations: int = 8,
     adviser_model: Optional[str] = None,
     escalate_after_render_failures: int = 5,
+    video_review_enabled: bool = True,
+    max_review_rounds: int = 2,
+    video_review_model: str = "gemini-2.5-pro",
 ) -> SceneResult:
     if item.complexity == "simple" or not item.sub_scenes:
         async with sem:
@@ -60,6 +63,9 @@ async def run_scene(
                     max_tool_iterations=max_tool_iterations,
                     adviser_model=adviser_model,
                     escalate_after_render_failures=escalate_after_render_failures,
+                    video_review_enabled=video_review_enabled,
+                    max_review_rounds=max_review_rounds,
+                    video_review_model=video_review_model,
                 )
             else:
                 result = await render_scene(
@@ -83,6 +89,7 @@ async def run_scene(
             resolution, aspect_ratio,
             prior_context, use_tool_worker, max_tool_iterations,
             adviser_model, escalate_after_render_failures,
+            video_review_enabled, max_review_rounds, video_review_model,
         ))
         for sub in item.sub_scenes
     ]
@@ -168,7 +175,10 @@ async def _run_sub_with_sem(sub, parent_item, plan, run_id, quality,
                             prior_context, use_tool_worker,
                             max_tool_iterations,
                             adviser_model=None,
-                            escalate_after_render_failures=5) -> SceneResult:
+                            escalate_after_render_failures=5,
+                            video_review_enabled=True,
+                            max_review_rounds=2,
+                            video_review_model="gemini-2.5-pro") -> SceneResult:
     sub_ident = f"{parent_item.id}__{sub.id}"
 
     # Cache lookup: if this sub-scene already produced a clean render in a
@@ -196,6 +206,9 @@ async def _run_sub_with_sem(sub, parent_item, plan, run_id, quality,
                 max_tool_iterations=max_tool_iterations,
                 adviser_model=adviser_model,
                 escalate_after_render_failures=escalate_after_render_failures,
+                video_review_enabled=video_review_enabled,
+                max_review_rounds=max_review_rounds,
+                video_review_model=video_review_model,
             )
         else:
             result = await render_scene(

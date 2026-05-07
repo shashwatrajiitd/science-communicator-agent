@@ -44,48 +44,60 @@ master QA loop iteratively patches scenes that fail post-stitch checks.
 ```mermaid
 flowchart TD
     T([topic]) --> P[Master Planner<br/>gemini-2.5-pro]
-    P -->|ScenePlan JSON| FANOUT{{"asyncio.Semaphore<br/>(parallelism=4)"}}
+    P -->|ScenePlan JSON| MODE{mode}
+    MODE -->|sequential default| SEQ[scene N → scene N+1<br/>with PriorContext handoff]
+    MODE -->|--parallel| FANOUT{{"asyncio.Semaphore<br/>(parallelism=4)"}}
 
-    FANOUT --> W1[Worker 01]
+    SEQ --> W[Tool-use Worker<br/>render_manim, extract_frames,<br/>probe_audio, compare_to_prior_frame,<br/>web_search, done]
+    W --> R[manim render]
+    R --> DV{done() validation}
+    DV -.fail.-> W
+    DV -->|pass| VR[**Full-video reviewer**<br/>upload mp4 → Gemini Files API<br/>media_resolution=LOW]
+    VR -.fail.-> W
+    VR -->|pass / cap reached| OK[scene_id.mp4]
+
+    FANOUT --> W1[Worker 01<br/>legacy text-repair]
     FANOUT --> W2[Worker 02]
     FANOUT --> WN[Worker NN]
-
     W1 --> R1[manim render]
     W2 --> R2[manim render]
     WN --> RN[manim render]
+    R1 --> J1[Frame Judge 01]
+    R2 --> J2[Frame Judge 02]
+    RN --> JN[Frame Judge NN]
 
-    R1 --> J1[Judge 01<br/>multimodal]
-    R2 --> J2[Judge 02<br/>multimodal]
-    RN --> JN[Judge NN<br/>multimodal]
-
-    J1 --> S[ffmpeg concat]
+    OK --> S[ffmpeg concat]
+    J1 --> S
     J2 --> S
     JN --> S
     S --> V1[/final.mp4 v1/]
 
     V1 --> QA[Master QA + Continuity<br/>deterministic + vision on<br/>adjacent boundaries]
     QA -->|overall_ok| DONE([final.mp4])
-    QA -->|issues found| PATCH[Patch failing scenes<br/>re-run Worker → Judge]
+    QA -->|issues found| PATCH[Patch failing scenes<br/>re-run Worker<br/>(reviewer skipped)]
     PATCH --> RES[re-stitch] --> QA
 
     classDef llm fill:#e1f0ff,stroke:#3b82f6,color:#000
     classDef io fill:#fef3c7,stroke:#d97706,color:#000
     classDef artifact fill:#dcfce7,stroke:#16a34a,color:#000
-    class P,J1,J2,JN,QA,W1,W2,WN llm
-    class R1,R2,RN,S,RES io
-    class V1,DONE,T artifact
+    classDef new fill:#fde9ff,stroke:#a855f7,color:#000
+    class P,J1,J2,JN,QA,W,W1,W2,WN llm
+    class R,R1,R2,RN,S,RES,DV io
+    class V1,DONE,T,OK artifact
+    class VR new
 ```
 
 Five LLM-driven roles, each implemented as a plain async function around
 Gemini structured output:
 
-| Role          | Module                       | Model used         | Output           |
-| ------------- | ---------------------------- | ------------------ | ---------------- |
-| Planner       | `src/agents/master.py`       | gemini-2.5-pro     | `ScenePlan`      |
-| Worker        | `src/agents/scene_worker.py` | gemini-2.5-pro     | Python file      |
-| Judge         | `src/agents/judge.py`        | gemini-2.5-pro (multimodal) | `JudgeReport` |
-| Continuity    | `src/agents/continuity.py`   | gemini-2.5-pro (multimodal) | issue list   |
-| Master QA     | `src/agents/master.py`       | gemini-2.5-pro     | `QAReport`       |
+| Role           | Module                        | Model used                              | Output                |
+| -------------- | ----------------------------- | --------------------------------------- | --------------------- |
+| Planner        | `src/agents/master.py`        | gemini-2.5-pro                          | `ScenePlan`           |
+| Worker         | `src/agents/scene_worker.py`  | gemini-2.5-pro (function-calling)       | Python file           |
+| Judge (legacy) | `src/agents/judge.py`         | gemini-2.5-pro (multimodal frames)      | `JudgeReport`         |
+| Video reviewer | `src/agents/video_reviewer.py`| gemini-2.5-pro (multimodal video)       | `VideoReviewReport`   |
+| Continuity     | `src/agents/continuity.py`    | gemini-2.5-pro (multimodal frames)      | issue list            |
+| Master QA      | `src/agents/master.py`        | gemini-2.5-pro                          | `QAReport`            |
 
 ADK is referenced conceptually, but in practice we call `google-genai` directly
 with `response_schema=` for structured output — that gave us the most reliable
@@ -113,9 +125,13 @@ science-communicator-agent/
 │       ├── pipeline.py      # top-level orchestrator (asyncio)
 │       ├── master.py        # Planner + Master QA + deterministic checks
 │       ├── scene_runner.py  # dispatch simple vs complex (sub-scene) rendering
-│       ├── scene_worker.py  # generate / render / judge / repair loop per scene
-│       ├── judge.py         # vision-based per-scene judge
+│       ├── scene_worker.py  # tool-use worker + post-done() reviewer loop
+│       ├── scene_worker_tools.py # FunctionDeclarations + dispatcher
+│       ├── judge.py         # legacy frame-based judge (parallel path)
+│       ├── video_reviewer.py # full-video reviewer (post-done(), plan-mode)
 │       ├── continuity.py    # cross-scene boundary check
+│       ├── plan_mode.py     # human-in-the-loop callbacks (--plan-mode)
+│       ├── log.py           # rich-styled scope logger
 │       ├── prompts.py       # all system prompts in one place
 │       ├── schemas.py       # dataclasses + Gemini response_schema dicts
 │       ├── tts.py           # GeminiTTSService (manim-voiceover adapter)
@@ -133,15 +149,26 @@ science-communicator-agent/
 
 ```
 output/<run_id>/
-├── plan.json                     # the ScenePlan from the planner
-├── qa.json                       # the latest QAReport
-├── continuity.json               # cross-scene boundary issues
-├── patch_log.json                # what was re-rendered and why
-├── scene_<id>.mp4                # one stable mp4 per scene (concat input)
-├── frames_<id>_attempt<N>/       # frames sampled for the judge
-├── continuity_frames/            # last/first frames of adjacent scenes
-├── judge_<id>_attempt<N>.json    # raw judge reports per attempt
-└── final.mp4                     # ← the deliverable
+├── plan.json                                  # the ScenePlan from the planner
+├── qa.json                                    # the latest QAReport
+├── continuity.json                            # cross-scene boundary issues
+├── patch_log.json                             # what was re-rendered and why
+├── reviews.jsonl                              # plan-mode operator action log
+├── scene_<id>.mp4                             # one stable mp4 per scene (concat input)
+├── scene_<id>.result.json                     # sub-scene cache sidecar
+├── <scene_id>/
+│   ├── attempts/<NN>/                         # per-render-attempt artifacts (tool-use)
+│   │   ├── scene.py                           # code passed to render_manim
+│   │   ├── scene.mp4                          # rendered video
+│   │   ├── log_tail.txt                       # last 2000B of manim stderr
+│   │   └── frames/                            # extract_frames output
+│   ├── last_frame.png                         # handoff to scene N+1
+│   ├── video_review_round_<N>.json            # automated review verdicts
+│   └── video_review_planmode_<N>.json         # plan-mode comment translations
+├── frames_<id>_attempt<N>/                    # legacy parallel-path frames
+├── continuity_frames/                         # last/first frames of adjacent scenes
+├── judge_<id>_attempt<N>.json                 # legacy judge reports per attempt
+└── final.mp4                                  # ← the deliverable
 ```
 
 When each artifact lands during a run:
@@ -246,9 +273,67 @@ spec, and the continuity agent later compares boundary frames against it.
 ### `SceneResult` — the worker's output for one scene
 
 `(id, scene_class, scene_file, video_path, duration_seconds, attempts,
-success, last_error, last_judge: JudgeReport)`.
+success, last_error, last_judge: JudgeReport, ending_state: str,
+last_frame_path: Path, final_review: dict | None)`.
 
-### `JudgeReport` — per-scene visual gate
+`final_review` is the serialized `VideoReviewReport` from the post-done()
+reviewer (None when the reviewer was disabled or the legacy parallel path
+ran). `ending_state` and `last_frame_path` feed the next scene's
+`PriorContext`.
+
+### `VideoReviewReport` — full-video industry-bar gate
+
+```mermaid
+classDiagram
+    class VideoReviewReport {
+        +bool passed
+        +str overall_assessment
+        +list~VideoReviewIssue~ issues
+        +str delivery
+    }
+    class VideoReviewIssue {
+        +Severity severity
+        +ReviewKind kind
+        +float t_start_s
+        +float t_end_s
+        +str description
+        +str fix_hint
+    }
+    class ReviewKind {
+        <<enumeration>>
+        animation_timing
+        narration_sync
+        text_readability
+        motion_quality
+        color_palette
+        math_correctness
+        continuity
+        composition
+        pacing
+        other
+    }
+    class Severity {
+        <<enumeration>>
+        low
+        medium
+        high
+        critical
+    }
+    VideoReviewReport "1" *-- "many" VideoReviewIssue
+    VideoReviewIssue ..> ReviewKind : kind
+    VideoReviewIssue ..> Severity : severity
+```
+
+`delivery` records which path produced the verdict — `"video"` (the Files
+API upload at `media_resolution=MEDIA_RESOLUTION_LOW` succeeded) or
+`"frames_fallback"` (the upload failed, so 8 PNGs were sent with the same
+prompt instead).
+
+`t_start_s`/`t_end_s` carry timestamps that survive into
+`format_video_review_hints()` so the worker's repair instruction reads
+"fix the camera jitter at 4.2s–5.8s" not "fix the camera jitter mid-scene".
+
+### `JudgeReport` — per-scene visual gate (legacy)
 
 ```mermaid
 classDiagram
@@ -306,6 +391,12 @@ Driver: `src/agents/pipeline.py::run`. All phases are `asyncio` and
 `asyncio.to_thread` wraps every blocking SDK / subprocess call.
 
 ### End-to-end sequence
+
+The diagram below shows the **legacy parallel path** (`--parallel`,
+`--no-tool-worker`) — kept for clarity since it's the simplest mental
+model. The default sequential + tool-use path adds a function-calling loop
+inside each worker (§9b) and a full-video reviewer gate after `done()`
+(§9c); see those sections for the corresponding diagrams.
 
 ```mermaid
 sequenceDiagram
@@ -578,22 +669,27 @@ multi-agent-specific instructions:
 
 ## 8. Quality gates summary
 
-| Gate                | When it runs                          | What it checks                                                  | Severity that gates progress |
-| ------------------- | ------------------------------------- | --------------------------------------------------------------- | ---------------------------- |
-| Render success      | Every worker attempt                  | Subprocess `manim` exits 0 and produces an mp4                  | Hard fail → repair           |
-| Per-scene Judge     | Every successful render               | Layout, geometry, narration match, duration, correctness checks, shared-objects fidelity | medium/high → repair |
-| Continuity-mode Judge | After concatenating sub-scenes      | Continuity across the joined clip                               | non-blocking (logged)        |
-| Deterministic QA    | Each patch pass                       | Missing renders, render fails, ±40% scene drift, ±30% total drift | medium/high → patch       |
-| Continuity check    | Each patch pass (if shared_objects)   | Last/first-frame comparison for shared objects                  | medium/high → patch          |
-| Master QA           | Each patch pass                       | Cross-scene narrative flow, pacing                              | medium/high → patch          |
+| Gate                  | When it runs                          | What it checks                                                                              | Severity that gates progress  |
+| --------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------- | ----------------------------- |
+| Render success        | Every worker attempt                  | Subprocess `manim` exits 0 and produces an mp4                                              | Hard fail → repair            |
+| `done()` validation   | Every `done()` call (tool-use path)   | Video exists, ≥1 KB, ffprobe-readable, duration ≥ 0.5s, audio present                       | Reject → next render          |
+| Per-scene Judge       | Every successful render (parallel path only) | Layout, geometry, narration match, duration, correctness checks, shared-objects fidelity | medium/high → repair          |
+| **Full-video reviewer** | After `done()` accepts (sequential path, default on) | Animation timing, narration sync, text readability, motion quality, math correctness, color palette, prior-scene continuity. Returns timestamped fix_hints. | high/critical (any) → resume tool loop with feedback, capped at `--max-review-rounds` |
+| Continuity-mode Judge | After concatenating sub-scenes        | Continuity across the joined clip                                                           | non-blocking (logged)         |
+| Deterministic QA      | Each patch pass                       | Missing renders, render fails, ±40% scene drift, ±30% total drift                           | medium/high → patch           |
+| Continuity check      | Each patch pass (if shared_objects)   | Last/first-frame comparison for shared objects                                              | medium/high → patch           |
+| Master QA             | Each patch pass                       | Cross-scene narrative flow, pacing                                                          | medium/high → patch           |
 
 ### Where each gate sits
 
 ```mermaid
 flowchart LR
-    subgraph PerScene["Per-scene loop (worker)"]
+    subgraph PerScene["Per-scene loop (sequential + tool-use)"]
         direction TB
-        G1[Render success] --> G2[Per-scene Judge]
+        G1[Render success] --> G1b[done() validation]
+        G1b --> G1c[Full-video reviewer<br/>industry-bar gate<br/>upload mp4 → timestamped issues]
+        G1c -.fail.-> G1[resume tool loop<br/>with formatted hints]
+        G1c -.legacy parallel.-> G2[Per-scene Judge<br/>frame-based]
         G2 -.sub-scenes only.-> G3[Continuity-mode Judge]
     end
     subgraph Global["Patch loop (post-stitch)"]
@@ -607,8 +703,10 @@ flowchart LR
 
     classDef hard fill:#fee2e2,stroke:#dc2626,color:#000
     classDef soft fill:#fef3c7,stroke:#d97706,color:#000
-    class G1,G4 hard
+    classDef new fill:#e1f0ff,stroke:#3b82f6,color:#000
+    class G1,G1b,G4 hard
     class G2,G3,G5,G6 soft
+    class G1c new
 ```
 
 Patch budget: `--patch-passes` (default 2). Per-scene retry budget:
@@ -646,7 +744,12 @@ Common flags:
 | `--aspect-ratio` / `--aspect` | `16:9`    | Output aspect ratio: `16:9`, `9:16`, `1:1`, `4:5`, `21:9`, … |
 | `--parallel / --no-parallel` | `--no-parallel` | Render scenes in parallel (legacy). Default is sequential. |
 | `--tool-worker / --no-tool-worker` | `--tool-worker` | Use the Gemini function-calling self-validating worker.  |
-| `--max-tool-iterations` | `8`           | Hard ceiling on tool calls per scene (tool-use worker only). |
+| `--max-tool-iterations` | `12`          | Hard ceiling on tool calls per scene (tool-use worker only). |
+| `--video-review / --no-video-review` | `--video-review` | Run the full-video reviewer after `done()`; loop the worker on failure. |
+| `--max-review-rounds` | `2`             | Cap on review rounds per scene before accepting current render. |
+| `--video-review-model` | `gemini-2.5-pro` | Model used by the post-done() reviewer + plan-mode comment translation. |
+| `--adviser-model` | `gemini-3.1-pro-preview` | Escalation target after `--escalate-after-render-failures` total render_manim calls without `done()`. |
+| `--escalate-after-render-failures` | `4` | Total `render_manim` calls before swapping to the adviser model. |
 
 ---
 
@@ -863,7 +966,9 @@ sequenceDiagram
 | `--parallel` | off | Restore legacy `asyncio.gather` path; no prior context |
 | `--tool-worker` (default on) | on | Use the function-calling worker |
 | `--no-tool-worker` | — | Fall back to legacy text-only repair worker (still useful with `--parallel`) |
-| `--max-tool-iterations` | `8` | Cap on tool calls per scene |
+| `--max-tool-iterations` | `12` | Cap on tool calls per scene |
+| `--video-review` (default on) | on | Run the full-video reviewer after `done()` (§9c) |
+| `--max-review-rounds` | `2` | Cap on review rounds per scene |
 
 ### Hooks for `--plan-mode`
 
@@ -883,7 +988,187 @@ Both callables can be sync or async — `pipeline._maybe_await` handles either.
 
 ---
 
-## 9c. `--plan-mode`: human-in-the-loop review
+## 9c. Full-video reviewer (`src/agents/video_reviewer.py`)
+
+The default sequential pipeline ships a per-scene quality gate that watches
+the **complete rendered video**, not sampled frames. It runs AFTER the
+worker calls `done()` and BEFORE the scene is accepted into the stitcher.
+
+### Why the worker can't be its own reviewer
+
+The tool-use worker decides when to call `done()` based on its own inspection
+(rendered frames + audio probe + prior-frame diff). That works for catching
+obvious failures — wrong shapes, missing audio, blank frames — but tends to
+miss:
+
+- **Animation timing** — jerky transitions, instant snaps that should ease,
+  drag durations that don't match the narration.
+- **Narration ↔ visual sync** — the voiceover finishes 1.5s before the
+  equation appears, or the wave morphs while the line "as the wave morphs"
+  still has 0.8s of audio left.
+- **Motion smoothness** — frame-rate hiccups invisible in still frames.
+- **Subjective composition** — text overflowing the safe zone, off-palette
+  colors, cluttered layout.
+
+Eight evenly-spaced PNGs sampled by the legacy frame-judge can't catch any
+of these — motion lives between frames. The Gemini Files API can ingest the
+whole mp4, sampled by the model itself at low media resolution, and judge
+all of the above with timestamps.
+
+### Architecture
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SW as scene_worker._run_with_review_loop
+    participant TL as _drive_tool_loop
+    participant VR as video_reviewer.review_scene_video
+    participant FA as Gemini Files API
+    participant G as Gemini 2.5 Pro
+
+    SW->>TL: run tool loop until model calls done()
+    TL-->>SW: contents, accepted_video, summary
+
+    loop up to --max-review-rounds (default 2)
+        SW->>VR: review_scene_video(video, target, plan, prior_frame, prior_code)
+        VR->>FA: client.files.upload(file=mp4)
+        FA-->>VR: File(name, uri, state=PROCESSING)
+        loop poll until ACTIVE
+            VR->>FA: client.files.get(name)
+            FA-->>VR: File(state=ACTIVE)
+        end
+        VR->>G: generate_content(<br/>  contents=[Part.from_uri(uri),<br/>            prior_frame_png,<br/>            prompt],<br/>  media_resolution=LOW,<br/>  response_schema=VideoReviewReport<br/>)
+        G-->>VR: VideoReviewReport JSON
+        VR->>FA: client.files.delete(name)
+        VR-->>SW: VideoReviewReport(passed, issues[], delivery)
+
+        alt passed
+            SW->>SW: break — finalize SceneResult
+        else failed + thrashing detected
+            SW->>SW: break — accept current render with unresolved issues
+        else failed
+            SW->>SW: append synthetic user turn (formatted hints) to contents
+            SW->>TL: _drive_tool_loop(contents=...)
+            TL-->>SW: new accepted_video, summary
+        end
+    end
+
+    SW->>SW: extract_last_frame(accepted_video) — AFTER review loop settles
+    SW-->>SW: SceneResult(success=True, final_review=report.to_dict())
+```
+
+The review feedback is a **synthetic user turn** appended to the existing
+`contents` list, then `_drive_tool_loop` is re-invoked with the populated
+list. This preserves the model's memory of every render attempt, every tool
+response, and every prior reviewer verdict — the model continues the same
+conversation rather than starting fresh.
+
+### Review criteria
+
+The system prompt orders the reviewer's priorities (highest first):
+
+1. **Mathematical / factual correctness** — wrong sign, mis-rendered
+   exponent, axis scale wrong → `critical` even if the animation looks
+   pretty.
+2. **Narration ↔ visual sync** — out-of-phase voiceover and animation.
+3. **Animation timing & motion quality** — jerky/instant transitions,
+   missing easing.
+4. **Text readability** — clipping, font weight, hierarchy.
+5. **Continuity with prior scene** — when a prior-scene last frame is
+   attached, persistent mobjects must keep position/color/geometry.
+6. **Composition & color palette** — 3Blue1Brown aesthetic.
+7. **Pacing per beat** — long static stretches while narration runs.
+
+The schema requires every issue to carry a `t_start_s`/`t_end_s` range so
+the worker's repair instruction is anchored to a specific moment — not "fix
+the equation timing" but "shorten the `Write(eq)` `run_time` from 2.0 to
+1.0; the equation finishes at 6.4s but the narration moves on at 5.1s".
+
+### Delivery: video upload + frame fallback
+
+Primary path:
+
+```python
+uploaded = client.files.upload(file=str(video_path))
+# poll uploaded = client.files.get(name=...) until state == ACTIVE
+response = client.models.generate_content(
+    model="gemini-2.5-pro",
+    contents=[Part.from_uri(file_uri=uploaded.uri, mime_type="video/mp4"),
+              prior_frame_png, prompt_text],
+    config=GenerateContentConfig(
+        media_resolution="MEDIA_RESOLUTION_LOW",
+        response_mime_type="application/json",
+        response_schema=VIDEO_REVIEW_REPORT_SCHEMA,
+    ),
+)
+client.files.delete(name=uploaded.name)   # in finally — even on exception
+```
+
+`media_resolution=MEDIA_RESOLUTION_LOW` cuts the per-second video token
+spend roughly 3× vs default. For QA the model needs to see motion and read
+labels, not pixel detail. Per-scene-per-round cost on a 30s scene at LOW is
+typically 8–12k input tokens + 1–3k structured output.
+
+Files-API quota is bounded by `try/finally` cleanup so a flaky run doesn't
+fill the account quota.
+
+If upload, polling, or the generate call fails, the same prompt is rerun
+with 8 frames sampled via `extract_frames()` and submitted as PNG parts.
+The verdict's `delivery` field records which path produced it
+(`"video"` vs `"frames_fallback"`). The frames fallback also tells the
+model in-prompt that it can't judge motion smoothness — biasing it away
+from false positives.
+
+### Thrashing detection
+
+The reviewer can flag issues the model can't actually fix (e.g. manim
+limitations, conflicting plan beats). Across rounds we compare the
+multi-set of `(severity, kind)` pairs:
+
+```python
+def no_progress(prev, curr):
+    prev_high = {(i.severity, i.kind) for i in prev.issues if i.severity in ("high", "critical")}
+    curr_high = {(i.severity, i.kind) for i in curr.issues if i.severity in ("high", "critical")}
+    if not prev_high:
+        return False
+    return prev_high.issubset(curr_high) and len(curr.issues) >= len(prev.issues)
+```
+
+When the prior round's high-severity (kind, severity) pairs ALL still
+appear AND the total issue count didn't drop, the loop exits early and the
+current render is accepted with its unresolved issues recorded in
+`SceneResult.final_review`.
+
+### Persistence
+
+Every round writes a verdict next to the scene's other artifacts:
+
+```
+output/<run_id>/<scene_id>/
+├── attempts/01/                       # the render that round 1 reviewed
+├── attempts/02/                       # the render produced AFTER round 1's hints
+├── video_review_round_1.json          # round 1 verdict
+├── video_review_round_2.json          # round 2 verdict (if needed)
+└── last_frame.png                     # extracted from the FINAL accepted video
+```
+
+`SceneResult.final_review` carries the last round's `VideoReviewReport`
+serialized as a dict, so plan-mode UX, master QA, and downstream tooling
+can all read structured timestamps and severities without re-uploading.
+
+### When the reviewer is skipped
+
+- `--no-video-review` — entirely off; behaves like the pre-reviewer pipeline.
+- Master-QA-driven re-renders — the master already produced structured
+  `extra_brief` patch hints; running an independent reviewer on top would
+  duplicate work and double-spend tokens. `pipeline.run` forces
+  `video_review_enabled=False` for those re-render calls.
+- The legacy parallel path (`--parallel`) — that path uses the legacy
+  frame-based `judge_scene()` instead.
+
+---
+
+## 9d. `--plan-mode`: human-in-the-loop review
 
 The default sequential pipeline (§9b) is fully autonomous. `--plan-mode`
 swaps in two interactive gates:
@@ -933,16 +1218,22 @@ sequenceDiagram
 
     loop per scene (sequential)
         P->>W: run_scene(item, plan, prior_context)
-        W-->>P: SceneResult
-        P->>PM: post_scene_approval(item, result, rerun)
+        W-->>P: SceneResult (with final_review)
+        P->>PM: post_scene_approval(item, result, rerun, translate_comment)
 
         loop until approved or cap
             PM->>U: panel + auto-open mp4
             U-->>PM: a / c <comment> / r / q
-            alt comment or retry
-                PM->>P: rerun(extra_brief=...)
+            alt comment
+                PM->>P: translate_comment(item, result, comment)
+                P->>P: review_scene_video(<br/>  user_comment=comment,<br/>  prior_code=...)
+                P-->>PM: formatted prose hints
+                PM->>P: rerun(extra_brief=hints)
                 P->>W: run_scene(... extra_brief)
                 W-->>P: SceneResult'
+                P-->>PM: SceneResult'
+            else retry
+                PM->>P: rerun(extra_brief=None)
                 P-->>PM: SceneResult'
             end
         end
@@ -968,12 +1259,50 @@ sequenceDiagram
 | Key | Plan gate | Scene gate (clean render) | Scene gate (failed render) |
 |-----|-----------|---------------------------|----------------------------|
 | `a` | approve plan, continue to render | approve scene, continue to next | **disabled** |
-| `c` | comment + revise plan via LLM | comment + re-render scene | comment + re-render scene |
+| `c` | comment + revise plan via LLM | comment + reviewer translation + re-render | comment + reviewer translation + re-render |
 | `r` | — | retry scene without a comment | retry scene without a comment |
 | `q` | abort with exit code 2 | abort with exit code 2 | abort with exit code 2 |
 
 Either the literal letter or the prefix of the label works (`approve`, `comm`,
 etc.). Pressing Enter takes the default (`a` for clean renders, `r` for failed).
+
+### Comment translation
+
+When you press `[c]` on a scene gate and type a free-form comment, the
+operator's prose is sent to the **video reviewer** (§9c) along with the
+rendered mp4 and the previous render's Python source. The reviewer is
+prompted to ANCHOR its review on the operator comment but may also surface
+any other high-severity issues it spots. The output is a
+`VideoReviewReport` with structured timestamps and code-anchored
+`fix_hint`s, which is then rendered into prose via
+`format_video_review_hints()` and forwarded to the worker as `extra_brief`.
+
+```mermaid
+flowchart LR
+    OP["operator: 'equation looks weird'"] --> TR[translate_comment closure<br/>built per-scene by pipeline.run]
+    TR --> VR[video_reviewer.review_scene_video<br/>user_comment=...,<br/>prior_code=scene.py]
+    VR --> RP[VideoReviewReport<br/>passed=false<br/>issues=[3 timestamped fixes]]
+    RP --> FH[format_video_review_hints]
+    FH --> EB[extra_brief prose<br/>'[high] math_correctness at 7.4s–8.1s:<br/>exponent rendered as -2 instead of 2.<br/>Fix: change MathTex r&#94;2 not r&#94;-2.']
+    EB --> W[run_scene rerun]
+    W --> SR[new SceneResult]
+
+    classDef llm fill:#e1f0ff,stroke:#3b82f6,color:#000
+    classDef io fill:#fef3c7,stroke:#d97706,color:#000
+    class VR,FH llm
+    class TR,EB io
+```
+
+Each translation persists to
+`output/<run_id>/<scene_id>/video_review_planmode_N.json` with both the
+verbatim operator comment and the reviewer's structured report. If the
+reviewer call fails (network, Files API quota, parse error), plan-mode
+falls back to passing the raw comment as before — operator intent is
+never blocked on reviewer availability.
+
+The translation is gated on `--video-review` being enabled. With
+`--no-video-review`, comments are forwarded as raw text exactly as in the
+pre-reviewer pipeline.
 
 ### Clean-render gate
 
@@ -1097,6 +1426,51 @@ per-run-id subdirectory convention.
   have settled. That avoids re-rendering a scene many times for a
   mismatch its neighbour caused, and keeps the per-scene worker feedback
   loop fast and local.
+- **The reviewer runs OUTSIDE the `done()` dispatcher, not inside it.**
+  An earlier draft put the reviewer call inside `_tool_done` so failed
+  reviews would naturally fall back into the function-calling loop. That
+  would have made `done()` non-terminal — a 30–60s upload + Gemini call
+  inside a tool-response, swallowed by the bare `except` in `dispatch`,
+  and the model can't read text in `function_calling_config=ANY` mode so
+  it had no way to plan a different approach. We keep `done()` fast and
+  deterministic, run the reviewer in `_run_with_review_loop` after
+  `_drive_tool_loop` returns, and resume the SAME `contents` list with a
+  synthetic user turn carrying the formatted feedback. Preserves the
+  model's working memory and keeps the `max_iter` safety net.
+- **`last_frame.png` is extracted AFTER the review loop terminates.** If
+  the reviewer triggers a re-render on round 1, the round-2 mp4 replaces
+  the accepted video — but the prior-context handoff to scene N+1 must
+  point at the FINAL accepted video's last frame, not the rejected
+  earlier render. We moved `extract_last_frame` past the review loop in
+  `_finalize_tool_result` so a stale handoff frame can't propagate.
+- **`media_resolution=MEDIA_RESOLUTION_LOW` for video review.** Industry-
+  bar judgment needs to see motion and read labels, not pixel detail.
+  LOW cuts video tokens roughly 3× vs default. A 30s scene at LOW is
+  ~8–12k input tokens of video — affordable to run on every scene at
+  every round.
+- **Files API cleanup in `try/finally`.** Cleanup-on-success is fine; the
+  failure mode that bites is cleanup-on-exception leaving uploads on the
+  account quota. `review_scene_video` always deletes the uploaded file
+  whether the model call returned, raised, or timed out.
+- **Frame fallback shares the prompt with the video path.** If the Files
+  API fails, we extract 8 frames and rerun the same review prompt with
+  PNG parts instead of a `Part.from_uri`. One source of truth for the
+  reviewer prompt; the verdict's `delivery` field records which path
+  produced it.
+- **Skip the reviewer in master-QA-driven re-renders.** When the master
+  patch loop calls `run_scene` with `extra_brief=<patch hints>`, those
+  hints already encode structured feedback. Running an independent
+  reviewer on top would duplicate work and double-spend tokens. The
+  reviewer is gated off for those re-render calls.
+- **Plan-mode comment translation reuses the reviewer.** Operator
+  comments in `--plan-mode` are vague by design ("equation looks
+  weird"). Rather than asking the worker to interpret them, we route the
+  comment through the same `review_scene_video` function with the
+  comment as a strong prior and the previous render's source code as
+  context. The reviewer outputs structured timestamped fix hints which
+  are formatted into the same prose shape the automated review loop
+  produces — the worker sees one consistent feedback format whether the
+  origin was an LLM verdict or an operator's nudge.
 
 ---
 

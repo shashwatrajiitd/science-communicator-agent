@@ -212,6 +212,12 @@ class WorkerToolContext:
     last_render_path: Optional[Path] = None
     last_code: Optional[str] = None
     last_log_tail: Optional[str] = None
+    # Full-video reviewer (post-done()) settings. The dispatcher does NOT
+    # invoke the reviewer; render_scene_with_tools reads these fields after
+    # _drive_tool_loop returns and runs the review loop in worker code.
+    video_review_enabled: bool = True
+    max_review_rounds: int = 2
+    video_review_model: str = "gemini-2.5-pro"
 
 
 def dispatch(name: str, args: dict, ctx: WorkerToolContext) -> dict:

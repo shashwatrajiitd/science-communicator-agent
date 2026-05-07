@@ -187,6 +187,10 @@ class SceneResult:
     # of the rendered scene. Both feed into PriorContext for scene N+1.
     ending_state: str = ""
     last_frame_path: Optional[Path] = None
+    # Full-video reviewer's final verdict, if the reviewer ran. Stored as a
+    # plain dict (VideoReviewReport.to_dict()) to keep serialization simple.
+    # None when the reviewer was disabled or skipped.
+    final_review: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return _to_serializable(asdict(self))

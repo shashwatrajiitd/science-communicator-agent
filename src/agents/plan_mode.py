@@ -55,7 +55,17 @@ def _is_clean_render(result: SceneResult) -> bool:
 
 PrePlanApproval = Callable[[ScenePlan], Awaitable[ScenePlan]]
 RerunFn = Callable[[Optional[str]], Awaitable[SceneResult]]
-PostSceneApproval = Callable[[ScenePlanItem, SceneResult, RerunFn], Awaitable[SceneResult]]
+# Translates an operator's vague comment into structured fix hints by
+# uploading the rendered video to the video reviewer. Returns the formatted
+# prose hint to forward to the worker, or None on failure (caller falls
+# back to the raw comment).
+TranslateCommentFn = Callable[
+    [ScenePlanItem, SceneResult, str], Awaitable[Optional[str]]
+]
+PostSceneApproval = Callable[
+    [ScenePlanItem, SceneResult, RerunFn, Optional[TranslateCommentFn]],
+    Awaitable[SceneResult],
+]
 
 
 def make_callbacks(
@@ -80,12 +90,15 @@ def make_callbacks(
         )
 
     async def post_scene_approval(item: ScenePlanItem, result: SceneResult,
-                                  rerun: RerunFn) -> SceneResult:
+                                  rerun: RerunFn,
+                                  translate_comment: Optional[TranslateCommentFn] = None,
+                                  ) -> SceneResult:
         return await _interactive_scene_approval(
             item, result, rerun,
             reviews_path=reviews_path,
             auto_open=auto_open,
             max_rounds=max_rounds,
+            translate_comment=translate_comment,
         )
 
     return pre_plan_approval, post_scene_approval
@@ -143,7 +156,9 @@ async def _interactive_scene_approval(item: ScenePlanItem, result: SceneResult,
                                       rerun: RerunFn, *,
                                       reviews_path: Path,
                                       auto_open: bool,
-                                      max_rounds: int) -> SceneResult:
+                                      max_rounds: int,
+                                      translate_comment: Optional[TranslateCommentFn] = None,
+                                      ) -> SceneResult:
     rounds = 0
     opened_paths: set[str] = set()
     while True:
@@ -205,11 +220,35 @@ async def _interactive_scene_approval(item: ScenePlanItem, result: SceneResult,
                 continue
             _append_review(reviews_path, phase="scene", scene_id=item.id,
                            action="comment", comment=comment)
+            extra = comment
+            # Translate the operator's free-form comment into structured fix
+            # hints by sending the rendered video + comment to the reviewer.
+            # On failure, fall back to passing the raw comment — never block
+            # the operator's intent on reviewer availability.
+            if translate_comment is not None:
+                with _console.status(
+                    f"[cyan]Translating comment via video reviewer "
+                    f"(round {rounds}/{max_rounds})...[/]",
+                    spinner="dots",
+                ):
+                    try:
+                        translated = await translate_comment(item, result, comment)
+                    except Exception as exc:
+                        _console.print(
+                            f"[yellow]Comment translation failed: {exc!r}; "
+                            f"falling back to raw comment.[/]"
+                        )
+                        translated = None
+                if translated:
+                    extra = translated
+                    _console.print(
+                        "[dim]Reviewer translated comment into structured hints "
+                        "(see video_review_planmode_*.json in scene artifacts).[/]"
+                    )
             _console.print(
                 f"[cyan]Re-rendering scene {item.id} with feedback "
                 f"(round {rounds}/{max_rounds})...[/]"
             )
-            extra = comment
         else:  # action == "r"
             _append_review(reviews_path, phase="scene", scene_id=item.id,
                            action="retry", comment=None)

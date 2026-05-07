@@ -162,6 +162,26 @@ def main(
             "'render succeeds but model keeps re-rendering' loops."
         ),
     ),
+    video_review: bool = typer.Option(
+        True, "--video-review/--no-video-review",
+        help=(
+            "After the worker calls done(), upload the rendered mp4 to "
+            "Gemini for an industry-bar review. If the reviewer flags issues, "
+            "the worker conversation is resumed with structured feedback "
+            "until --max-review-rounds is exhausted or the reviewer passes."
+        ),
+    ),
+    max_review_rounds: int = typer.Option(
+        2, "--max-review-rounds",
+        help="Max video-review rounds per scene before accepting current render.",
+    ),
+    video_review_model: str = typer.Option(
+        "gemini-2.5-pro", "--video-review-model",
+        help=(
+            "Model used for the post-done() video review and plan-mode "
+            "operator-comment translation."
+        ),
+    ),
     plan_mode: bool = typer.Option(
         False, "--plan-mode/--no-plan-mode",
         help=(
@@ -240,6 +260,9 @@ def main(
         max_tool_iterations=max_tool_iterations,
         adviser_model=adviser_model or None,
         escalate_after_render_failures=escalate_after_render_failures,
+        video_review_enabled=video_review,
+        max_review_rounds=max_review_rounds,
+        video_review_model=video_review_model,
         pre_plan_approval=pre_plan_cb,
         post_scene_approval=post_scene_cb,
     ))
